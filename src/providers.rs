@@ -7,6 +7,7 @@ use crate::model::*;
 use serde_json::Value;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -156,6 +157,7 @@ pub fn parse_claude(v: &Value, plan: Option<String>) -> Result<Quota, FetchError
             used: pct(&w["utilization"])?,
             resets_at: w["resets_at"].as_str().and_then(parse_time),
             detail: None,
+            period: None,
         })
     };
     let windows: Vec<Window> = [win("five_hour", "5H", "5 小時"), win("seven_day", "7D", "每週")]
@@ -213,7 +215,7 @@ pub fn parse_codex(v: &Value, now: i64) -> Result<Quota, FetchError> {
             let resets_at = w["reset_at"]
                 .as_i64()
                 .or_else(|| w["reset_after_seconds"].as_i64().map(|s| now + s));
-            Some(Window { short, name, used, resets_at, detail: None })
+            Some(Window { short, name, used, resets_at, detail: None, period: None })
         })
         .collect();
     if windows.is_empty() {
@@ -353,6 +355,7 @@ pub fn parse_copilot(v: &Value) -> Result<Quota, FetchError> {
             used: (100.0 - remaining).clamp(0.0, 100.0),
             resets_at,
             detail: left.map(|l| format!("剩 {} / {} 次", l.floor() as i64, entitlement as i64)),
+            period: None,
         })
     })
     .collect();
@@ -413,10 +416,15 @@ fn antigravity() -> Result<Quota, FetchError> {
     let out = reader.join().unwrap_or_default();
     let v: Value = serde_json::from_str(out.trim_start_matches('\u{feff}').trim())
         .map_err(|_| FetchError::Other("agy 回應格式無法辨識".into()))?;
-    parse_antigravity(&v)
+    parse_antigravity(&v, AGY_PERIOD.load(Ordering::Relaxed))
 }
 
-pub fn parse_antigravity(v: &Value) -> Result<Quota, FetchError> {
+/// Antigravity 工作列上每組要顯示哪個時間長度：0 最緊的、1 五小時、2 每週。
+pub static AGY_PERIOD: AtomicU32 = AtomicU32::new(0);
+/// 選單上的名稱，順序對應 `AGY_PERIOD` 的值。
+pub const AGY_PERIOD_NAMES: [&str; 3] = ["較緊的那個", "5 小時", "每週"];
+
+pub fn parse_antigravity(v: &Value, pref: u32) -> Result<Quota, FetchError> {
     let is_usage = v["command"]["name"].as_str() == Some("usage") && v["num_turns"].as_i64() == Some(0);
     if !is_usage {
         return Err(FetchError::Disabled(
@@ -424,44 +432,57 @@ pub fn parse_antigravity(v: &Value) -> Result<Quota, FetchError> {
         ));
     }
     let mut windows = Vec::new();
-    let mut extra = Vec::new();
     for g in v["command"]["data"]["groups"].as_array().into_iter().flatten() {
         let gname = g["name"].as_str().unwrap_or("?");
         let short = if gname.starts_with("Gemini") { "GEM" } else { "C+G" };
-        let mut buckets: Vec<Window> = g["buckets"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|b| {
-                let remaining = pct(&b["remaining_fraction"])?;
-                let win = match b["window"].as_str() {
-                    Some("5h") => "5 小時",
-                    Some("weekly") => "每週",
-                    Some(other) => other,
-                    None => "?",
-                };
-                Some(Window {
-                    short: short.into(),
-                    name: format!("{gname}（{win}）"),
-                    used: ((1.0 - remaining) * 100.0).clamp(0.0, 100.0),
-                    resets_at: b["reset_time"].as_str().and_then(parse_time),
-                    detail: None,
-                })
+        windows.extend(g["buckets"].as_array().into_iter().flatten().filter_map(|b| {
+            let remaining = pct(&b["remaining_fraction"])?;
+            let (win, period) = match b["window"].as_str() {
+                Some("5h") => ("5 小時", Some("5h")),
+                Some("weekly") => ("每週", Some("weekly")),
+                Some(other) => (other, None),
+                None => ("?", None),
+            };
+            Some(Window {
+                short: short.into(),
+                name: format!("{gname}（{win}）"),
+                used: ((1.0 - remaining) * 100.0).clamp(0.0, 100.0),
+                resets_at: b["reset_time"].as_str().and_then(parse_time),
+                detail: None,
+                period,
             })
-            .collect();
-        if buckets.is_empty() {
-            continue;
-        }
-        // 工作列顯示這組裡最緊的一個，其他放提示文字。
-        buckets.sort_by(|a, b| b.used.total_cmp(&a.used));
-        let mut it = buckets.into_iter();
-        windows.push(it.next().unwrap());
-        extra.extend(it);
+        }));
     }
     if windows.is_empty() {
         return Err(FetchError::Other("Antigravity 沒有回報額度".into()));
     }
-    Ok(Quota { plan: None, windows, extra })
+    let mut q = Quota { plan: None, windows, extra: Vec::new() };
+    arrange_antigravity(&mut q, pref);
+    Ok(q)
+}
+
+/// 每組（GEM、C+G）挑一個放工作列，其他放提示文字。`pref` 見 `AGY_PERIOD`；
+/// 指定的時間長度那組沒有時，退回顯示較緊的那個。切換時直接重排，不用重新查詢。
+pub fn arrange_antigravity(q: &mut Quota, pref: u32) {
+    let all: Vec<Window> = q.windows.drain(..).chain(q.extra.drain(..)).collect();
+    let mut groups: Vec<Vec<Window>> = Vec::new();
+    for w in all {
+        match groups.iter_mut().find(|g| g[0].short == w.short) {
+            Some(g) => g.push(w),
+            None => groups.push(vec![w]),
+        }
+    }
+    let want = match pref {
+        1 => Some("5h"),
+        2 => Some("weekly"),
+        _ => None,
+    };
+    for mut g in groups {
+        g.sort_by(|a, b| b.used.total_cmp(&a.used));
+        let i = want.and_then(|p| g.iter().position(|w| w.period == Some(p))).unwrap_or(0);
+        q.windows.push(g.remove(i));
+        q.extra.extend(g);
+    }
 }
 
 #[cfg(test)]
@@ -564,7 +585,7 @@ mod tests {
 
     #[test]
     fn antigravity_fixture() {
-        let q = parse_antigravity(&fixture("antigravity")).unwrap();
+        let q = parse_antigravity(&fixture("antigravity"), 0).unwrap();
         assert_eq!(q.windows.len(), 2);
         assert_eq!(q.windows[0].short, "GEM");
         assert!((q.windows[0].used - 41.998).abs() < 0.01, "取 5 小時（較緊）");
@@ -574,9 +595,30 @@ mod tests {
     }
 
     #[test]
+    fn antigravity_pick_period() {
+        let mut q = parse_antigravity(&fixture("antigravity"), 2).unwrap();
+        let periods = |q: &Quota| q.windows.iter().map(|w| (w.short.clone(), w.period)).collect::<Vec<_>>();
+        assert_eq!(periods(&q), [("GEM".into(), Some("weekly")), ("C+G".into(), Some("weekly"))]);
+        arrange_antigravity(&mut q, 1);
+        assert_eq!(periods(&q), [("GEM".into(), Some("5h")), ("C+G".into(), Some("5h"))]);
+        assert_eq!(q.extra.len(), 2);
+        arrange_antigravity(&mut q, 0);
+        assert_eq!(q, parse_antigravity(&fixture("antigravity"), 0).unwrap());
+    }
+
+    #[test]
+    fn antigravity_missing_period_falls_back() {
+        let v = serde_json::json!({"num_turns": 0, "command": {"name": "usage", "data": {"groups": [
+            {"name": "Gemini", "buckets": [{"window": "weekly", "remaining_fraction": 0.8}]}]}}});
+        let q = parse_antigravity(&v, 1).unwrap();
+        assert_eq!(q.windows[0].period, Some("weekly"));
+        assert!(q.extra.is_empty());
+    }
+
+    #[test]
     fn antigravity_rejects_prompt_answers() {
         // CLI 若把 /usage 當成提問，回應會有 num_turns > 0 且沒有 command。
         let v = serde_json::json!({"status": "SUCCESS", "response": "…", "num_turns": 1});
-        assert!(matches!(parse_antigravity(&v), Err(FetchError::Disabled(_))));
+        assert!(matches!(parse_antigravity(&v, 0), Err(FetchError::Disabled(_))));
     }
 }

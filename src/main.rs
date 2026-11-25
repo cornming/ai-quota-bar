@@ -53,6 +53,7 @@ const CMD_TOGGLE_WIDGET: usize = 22;
 const CMD_SHOW_REMAINING: usize = 23;
 const CMD_THEME_BASE: usize = 300;
 const THEME_NAMES: [&str; 3] = ["跟隨系統", "深色", "淺色"];
+const CMD_AGY_BASE: usize = 400;
 const WM_APP_TRAY: u32 = WM_APP + 2;
 const TRAY_ID: u32 = 1;
 
@@ -253,6 +254,11 @@ fn load_hidden() {
     for p in ALL {
         HIDDEN[p.index()].store(mask & (1 << p.index()) != 0, Ordering::Relaxed);
     }
+}
+
+fn load_agy_period() {
+    let v = reg_get_dword(HKEY_CURRENT_USER, REG_APP, "AgyPeriod").filter(|v| *v <= 2).unwrap_or(0);
+    providers::AGY_PERIOD.store(v, Ordering::Relaxed);
 }
 
 fn save_hidden() {
@@ -690,6 +696,14 @@ unsafe fn show_menu() {
         }
         AppendMenuW(menu, MF_POPUP, sub as usize, wide("Copilot 帳號").as_ptr());
     }
+    // Antigravity 工作列上顯示 5 小時還是每週的額度。
+    let agy_now = providers::AGY_PERIOD.load(Ordering::Relaxed) as usize;
+    let agy_menu = CreatePopupMenu();
+    for (i, name) in providers::AGY_PERIOD_NAMES.iter().enumerate() {
+        let flags = MF_STRING | if i == agy_now { MF_CHECKED } else { MF_UNCHECKED };
+        AppendMenuW(agy_menu, flags, CMD_AGY_BASE + i, wide(name).as_ptr());
+    }
+    AppendMenuW(menu, MF_POPUP, agy_menu as usize, wide("Antigravity 顯示").as_ptr());
     // 顯示在哪個螢幕的工作列。
     let screens = taskbar::screens();
     if screens.len() > 1 {
@@ -735,6 +749,16 @@ unsafe fn show_menu() {
             DestroyWindow(ctl);
         }
         CMD_TOGGLE_WIDGET => toggle_widget(),
+        c if (CMD_AGY_BASE..CMD_AGY_BASE + providers::AGY_PERIOD_NAMES.len()).contains(&c) => {
+            let pref = (c - CMD_AGY_BASE) as u32;
+            providers::AGY_PERIOD.store(pref, Ordering::Relaxed);
+            reg_set_dword(REG_APP, "AgyPeriod", pref);
+            // 已經查到的資料直接重排，不用等下次查詢。
+            if let Some(q) = SLOTS.lock().unwrap()[Provider::Antigravity.index()].as_mut().and_then(|s| s.quota.as_mut()) {
+                providers::arrange_antigravity(q, pref);
+            }
+            ensure_widget();
+        }
         c if (CMD_THEME_BASE..CMD_THEME_BASE + THEME_NAMES.len()).contains(&c) => {
             let t = (c - CMD_THEME_BASE) as u32;
             with(|u| u.theme = t);
@@ -927,6 +951,7 @@ fn debug_force_claude_refresh(report: &str) {
 /// `--dump <檔案>`：查一次全部，把提示文字寫到檔案後結束（驗證用）。
 fn dump(path: &str) {
     providers::set_copilot_login(reg_get_string(REG_APP, "CopilotAccount"));
+    load_agy_period();
     for p in ALL {
         store(p, p.fetch(), None);
     }
@@ -999,6 +1024,7 @@ fn main() {
             })
         });
         CTL.store(ctl as isize, Ordering::Relaxed);
+        load_agy_period();
         let workers = ALL.iter().map(|p| spawn_worker(*p)).collect();
         with(|u| u.workers = workers);
         tray_add(ctl);

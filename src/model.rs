@@ -15,6 +15,8 @@ pub struct Window {
     pub resets_at: Option<i64>,
     /// 額外說明，例如 "199/200 次"。
     pub detail: Option<String>,
+    /// 時間長度（"5h"、"weekly"）；目前只有 Antigravity 用來切換顯示哪一個。
+    pub period: Option<&'static str>,
 }
 
 /// 某一家目前的額度。`windows` 前兩個會顯示在工作列上。
