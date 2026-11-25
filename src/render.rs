@@ -35,11 +35,67 @@ const STALE: f32 = 0.4;
 /// LED 進度條的格數。
 const SEGMENTS: i32 = 8;
 
-fn level_color(used: f64) -> Rgb {
+/// 面板配色。深色是霓虹 HUD；淺色是白底、顏色加深以保持對比。
+pub struct Theme {
+    panel: Rgb,
+    panel_top: Rgb,
+    panel_alpha: f32,
+    accent: Rgb,
+    warn: Rgb,
+    crit: Rgb,
+    name: Rgb,
+    label: Rgb,
+    value: Rgb,
+    seg_off: Rgb,
+    idle: Rgb,
+    scan_alpha: f32,
+    border_alpha: (f32, f32),
+    glow_alpha: f32,
+}
+
+pub fn theme(light: bool) -> Theme {
+    if light {
+        Theme {
+            panel: hex(0xE8F0F5),
+            panel_top: hex(0xFAFCFE),
+            panel_alpha: 0.97,
+            accent: hex(0x0A8FB0),
+            warn: hex(0xC46A00),
+            crit: hex(0xD21A48),
+            name: hex(0x0B3A4A),
+            label: hex(0x5F7C8A),
+            value: hex(0x0E1A24),
+            seg_off: hex(0xCFDDE5),
+            idle: hex(0x9AA9B1),
+            scan_alpha: 0.025,
+            border_alpha: (0.40, 0.75),
+            glow_alpha: 0.12,
+        }
+    } else {
+        Theme {
+            panel: PANEL,
+            panel_top: PANEL_TOP,
+            panel_alpha: 0.94,
+            accent: NEON,
+            warn: WARN,
+            crit: CRIT,
+            name: NAME,
+            label: LABEL,
+            value: VALUE,
+            seg_off: SEG_OFF,
+            idle: IDLE,
+            scan_alpha: 0.035,
+            border_alpha: (0.22, 0.55),
+            glow_alpha: 0.22,
+        }
+    }
+}
+
+fn level_color(th: &Theme, used: f64) -> Rgb {
     match level(used) {
-        Level::Normal => NEON,
-        Level::Warn => WARN,
-        Level::Crit => CRIT,
+        Level::Normal => th.accent,
+        Level::Warn => th.warn,
+        Level::Crit => th.crit,
     }
 }
 
@@ -68,11 +124,14 @@ pub struct Model {
     pub blocks: Vec<Block>,
     /// 工作列是深色。面板本身固定深色，淺色工作列時加一圈外框陰影讓面板浮起來。
     pub dark: bool,
+    /// 面板用淺色主題。
+    pub light: bool,
     pub hover: bool,
     /// 顯示剩餘百分比（進度條也改成剩下多少），顏色仍依已用程度。
     pub show_remaining: bool,
 }
 
+#[derive(Clone)]
 pub struct Frame {
     pub w: i32,
     pub h: i32,
@@ -307,11 +366,15 @@ fn value_text(used: Option<f64>) -> String {
 }
 
 /// 這家目前最嚴重的程度，決定狀態燈顏色。
-fn block_color(b: &Block) -> Rgb {
+fn block_color(th: &Theme, b: &Block) -> Rgb {
     if b.stale {
-        return IDLE;
+        return th.idle;
     }
-    b.rows.iter().filter_map(|r| r.used).fold(None::<f64>, |m, u| Some(m.map_or(u, |m| m.max(u)))).map_or(IDLE, level_color)
+    b.rows
+        .iter()
+        .filter_map(|r| r.used)
+        .fold(None::<f64>, |m, u| Some(m.map_or(u, |m| m.max(u))))
+        .map_or(th.idle, |u| level_color(th, u))
 }
 
 // ---------- 版面 ----------
@@ -320,6 +383,7 @@ fn block_color(b: &Block) -> Rgb {
 pub fn render(m: &Model, h: i32, scale: f32) -> Frame {
     let s = |v: f32| (v * scale).round() as i32;
     let f = |v: f32| v * scale;
+    let th = theme(m.light);
     unsafe {
         let name_font = TextMask::new(s(9.5), 600, "Bahnschrift");
         let label_font = TextMask::new(s(8.5), 400, "Cascadia Mono");
@@ -349,7 +413,7 @@ pub fn render(m: &Model, h: i32, scale: f32) -> Frame {
             .blocks
             .iter()
             .map(|b| {
-                let icon = b.provider.and_then(|p| crate::icons::get(p, icon_size));
+                let icon = b.provider.and_then(|p| crate::icons::get(p, icon_size, m.light));
                 Lay {
                     head_w: if icon.is_some() { icon_size } else { dot_w + dot_gap + name_font.measure(&b.name).0 },
                     icon,
@@ -371,18 +435,18 @@ pub fn render(m: &Model, h: i32, scale: f32) -> Frame {
             // 淺色工作列：外圈淡陰影。
             cv.rrect_stroke(px0, py0, pw, ph, radius, f(2.0), hex(0x000000), 0.10);
         }
-        cv.rrect(px0, py0, pw, ph, radius, PANEL, 0.94, Some(PANEL_TOP));
+        cv.rrect(px0, py0, pw, ph, radius, th.panel, th.panel_alpha, Some(th.panel_top));
         // 掃描線。
         let step = s(3.0).max(2);
         let mut yy = py0 as i32 + 1;
         while (yy as f32) < py0 + ph - 1.0 {
             for xx in (px0 as i32 + 2)..((px0 + pw) as i32 - 2) {
-                cv.blend(xx, yy, NEON, 0.035);
+                cv.blend(xx, yy, th.accent, th.scan_alpha);
             }
             yy += step;
         }
         // 邊框與四角括號。
-        cv.rrect_stroke(px0 + 0.5, py0 + 0.5, pw - 1.0, ph - 1.0, radius, 1.0, NEON, if m.hover { 0.55 } else { 0.22 });
+        cv.rrect_stroke(px0 + 0.5, py0 + 0.5, pw - 1.0, ph - 1.0, radius, 1.0, th.accent, if m.hover { th.border_alpha.1 } else { th.border_alpha.0 });
         let arm = s(7.0);
         let t = s(1.5).max(1);
         let (l, tp, r, b) = (px0 as i32, py0 as i32, (px0 + pw) as i32, (py0 + ph) as i32);
@@ -392,8 +456,8 @@ pub fn render(m: &Model, h: i32, scale: f32) -> Frame {
             let vy = if dy > 0 { cy } else { cy - arm };
             let hy = if dy > 0 { cy } else { cy - t };
             let vx = if dx > 0 { cx } else { cx - t };
-            cv.fill(hx, hy, arm, t, NEON, corner_a);
-            cv.fill(vx, vy, t, arm, NEON, corner_a);
+            cv.fill(hx, hy, arm, t, th.accent, corner_a);
+            cv.fill(vx, vy, t, arm, th.accent, corner_a);
         }
 
         // 內容。
@@ -409,12 +473,12 @@ pub fn render(m: &Model, h: i32, scale: f32) -> Frame {
                 for yy in top..bot {
                     let t = (yy - top) as f32 / (bot - top).max(1) as f32;
                     let fade = 1.0 - (t * 2.0 - 1.0).abs();
-                    cv.blend(sx, yy, NEON, 0.35 * fade);
+                    cv.blend(sx, yy, th.accent, 0.35 * fade);
                 }
                 x += sep_gap * 2 + 1;
             }
             let a = if b.stale { STALE } else { 1.0 };
-            let dc = block_color(b);
+            let dc = block_color(&th, b);
             if let Some(icon) = &lay.icon {
                 // App 圖示；過期時轉灰階並淡化。右下角疊一顆狀態燈。
                 let iy = mid - icon.size / 2;
@@ -432,7 +496,7 @@ pub fn render(m: &Model, h: i32, scale: f32) -> Frame {
                 }
                 let lr = f(2.6);
                 let (lx, ly) = ((x + icon.size) as f32 - lr * 0.4, (iy + icon.size) as f32 - lr * 0.4);
-                cv.circle(lx, ly, lr + f(1.2), PANEL, 1.0);
+                cv.circle(lx, ly, lr + f(1.2), th.panel_top, 1.0);
                 if !b.stale {
                     cv.glow(lx - lr, ly - lr, lr * 2.0, lr * 2.0, f(4.0), dc, 0.35);
                 }
@@ -445,7 +509,7 @@ pub fn render(m: &Model, h: i32, scale: f32) -> Frame {
                 }
                 cv.circle(dcx, dcy, dot_r, dc, 1.0);
                 let name_base = mid + name_font.ascent() / 2 - s(1.0);
-                name_font.draw(&mut cv, &b.name, x + dot_w + dot_gap, name_base, NAME, a);
+                name_font.draw(&mut cv, &b.name, x + dot_w + dot_gap, name_base, th.name, a);
             }
 
             let cx = x + lay.head_w + name_gap;
@@ -454,28 +518,28 @@ pub fn render(m: &Model, h: i32, scale: f32) -> Frame {
             for (ri, r) in b.rows.iter().enumerate() {
                 let rc = first_center + row_pitch * ri as i32;
                 let base = rc + value_asc / 2 - s(1.0);
-                label_font.draw(&mut cv, &r.label, cx, base, LABEL, a);
+                label_font.draw(&mut cv, &r.label, cx, base, th.label, a);
                 // LED 分段條。
                 let bx = cx + lay.label_w + col_gap;
                 let by = rc - seg_h / 2;
                 let shown = r.used.map(|u| if m.show_remaining { 100.0 - u.clamp(0.0, 100.0) } else { u.clamp(0.0, 100.0) });
                 let lit = shown.map_or(0, |v| ((v / 100.0) * SEGMENTS as f64).ceil() as i32);
-                let color = r.used.map_or(IDLE, level_color);
+                let color = r.used.map_or(th.idle, |u| level_color(&th, u));
                 for k in 0..SEGMENTS {
                     let sx = bx + k * (seg_w + seg_gap);
                     if k < lit {
                         if !b.stale {
-                            cv.glow(sx as f32, by as f32, seg_w as f32, seg_h as f32, f(3.0), color, 0.22);
+                            cv.glow(sx as f32, by as f32, seg_w as f32, seg_h as f32, f(3.0), color, th.glow_alpha);
                         }
                         cv.fill(sx, by, seg_w, seg_h, color, a);
                     } else {
-                        cv.fill(sx, by, seg_w, seg_h, SEG_OFF, a);
+                        cv.fill(sx, by, seg_w, seg_h, th.seg_off, a);
                     }
                 }
                 let vt = value_text(shown);
                 let vcol = match r.used {
-                    Some(u) if level(u) != Level::Normal => level_color(u),
-                    _ => VALUE,
+                    Some(u) if level(u) != Level::Normal => level_color(&th, u),
+                    _ => th.value,
                 };
                 let vx = bx + bar_w + col_gap + value_w - value_font.measure(&vt).0;
                 value_font.draw(&mut cv, &vt, vx, base, vcol, a);
@@ -484,6 +548,46 @@ pub fn render(m: &Model, h: i32, scale: f32) -> Frame {
         }
         cv.into_frame()
     }
+}
+
+/// 更新時掃過的光澤：一道斜向的亮帶從左到右，`t` 是 0–1 的進度。
+/// 只加亮已經畫出來的像素（依原本的透明度），所以光不會跑到面板外面。
+/// 淺色面板上白光看不出來，改成一道淡淡的主題色光帶。
+pub fn sheen(base: &Frame, t: f32, scale: f32, light: bool) -> Frame {
+    // 光帶的顏色（BGR 順序，0–1）與強度。
+    let (tint, strength) = if light { ([0.69, 0.56, 0.04], 0.55) } else { ([1.0, 1.0, 0.92], 1.0) };
+    let mut out = base.clone();
+    let band = 22.0 * scale; // 亮帶的半寬
+    let skew = 0.8; // 每往下一個像素，亮帶往左偏多少
+    let h = base.h as f32;
+    let travel = base.w as f32 + band * 2.0 + skew * h;
+    let center = -band + t * travel;
+    for y in 0..base.h {
+        let row_center = center - skew * (y as f32 - h / 2.0);
+        let x0 = ((row_center - band).floor() as i32).max(0);
+        let x1 = ((row_center + band).ceil() as i32).min(base.w);
+        for x in x0..x1 {
+            let d = (x as f32 + 0.5 - row_center) / band;
+            if d.abs() >= 1.0 {
+                continue;
+            }
+            // 柔和的外圈加上中間一道細的高光。
+            let soft = (1.0 - d * d).powi(2) * 0.30;
+            let core = (1.0 - (d * 6.0).abs()).max(0.0) * 0.35;
+            let k = (soft + core) * strength;
+            let p = &mut out.px[(y * base.w + x) as usize];
+            let a = p[3] as f32;
+            if a < 8.0 {
+                continue;
+            }
+            // 預乘 alpha：顏色值不能超過 alpha。往白色（帶一點青）推。
+            let mix = |c: u8, target: f32| -> u8 { (c as f32 + (a * target - c as f32) * k).clamp(0.0, a) as u8 };
+            p[0] = mix(p[0], tint[0]);
+            p[1] = mix(p[1], tint[1]);
+            p[2] = mix(p[2], tint[2]);
+        }
+    }
+    out
 }
 
 /// 系統匣圖示：深色圓角方塊裡三根由低到高的霓虹 LED 柱。回傳未預乘的 BGRA。
@@ -505,4 +609,39 @@ pub fn tray_icon(size: i32) -> Vec<[u8; 4]> {
             [q(p[2]), q(p[1]), q(p[0]), q(p[3])]
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sheen_brightens_inside_panel_only() {
+        // 左半透明（面板外），右半是不透明的深色面板。
+        let (w, h) = (40, 10);
+        let mut px = vec![[0u8, 0, 0, 0]; (w * h) as usize];
+        for y in 0..h {
+            for x in 20..w {
+                px[(y * w + x) as usize] = [20, 15, 10, 240];
+            }
+        }
+        let base = Frame { w, h, px };
+        let out = sheen(&base, 0.5, 1.0, false);
+        let mut brighter = 0;
+        for (a, b) in base.px.iter().zip(&out.px) {
+            if a[3] == 0 {
+                assert_eq!(a, b, "面板外不能被畫上光");
+            }
+            assert!(b[0] <= b[3] && b[1] <= b[3] && b[2] <= b[3], "預乘 alpha 不能超過 alpha");
+            assert_eq!(a[3], b[3], "透明度不變");
+            if b[0] > a[0] {
+                brighter += 1;
+            }
+        }
+        assert!(brighter > 0, "亮帶經過的地方要變亮");
+        // 動畫開始前與結束後，亮帶都在畫面外。
+        assert_eq!(sheen(&base, 0.0, 1.0, false).px, base.px);
+        assert_eq!(sheen(&base, 1.0, 1.0, false).px, base.px);
+        assert_eq!(sheen(&base, 1.0, 1.0, true).px, base.px);
+    }
 }

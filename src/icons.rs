@@ -153,7 +153,7 @@ fn brighten_if_dark(px: &mut [[f32; 4]]) {
     }
 }
 
-fn load(p: Provider, size: i32) -> Option<Icon> {
+fn load(p: Provider, size: i32, light: bool) -> Option<Icon> {
     for path in candidates(p) {
         unsafe {
             let w = wide(&path.display().to_string());
@@ -166,7 +166,10 @@ fn load(p: Provider, size: i32) -> Option<Icon> {
             DestroyIcon(icon);
             if let Some(mut px) = px {
                 if px.iter().any(|p| p[3] > 0.1) {
-                    brighten_if_dark(&mut px);
+                    // 淺色面板上原本的圖示就看得清楚，只有深色面板要把灰暗的圖示調亮。
+                    if !light {
+                        brighten_if_dark(&mut px);
+                    }
                     return Some(Icon { size, px });
                 }
             }
@@ -176,16 +179,16 @@ fn load(p: Provider, size: i32) -> Option<Icon> {
 }
 
 thread_local! {
-    static CACHE: RefCell<HashMap<(u8, i32), Option<Rc<Icon>>>> = RefCell::new(HashMap::new());
+    static CACHE: RefCell<HashMap<(u8, i32, bool), Option<Rc<Icon>>>> = RefCell::new(HashMap::new());
 }
 
 /// 取得某家在指定大小的圖示；結果會快取（找不到也記住，不會一直重找）。
-pub fn get(p: Provider, size: i32) -> Option<Rc<Icon>> {
-    let key = (p.index() as u8, size);
+pub fn get(p: Provider, size: i32, light: bool) -> Option<Rc<Icon>> {
+    let key = (p.index() as u8, size, light);
     if let Some(hit) = CACHE.with(|c| c.borrow().get(&key).cloned()) {
         return hit;
     }
-    let v = load(p, size).map(Rc::new);
+    let v = load(p, size, light).map(Rc::new);
     CACHE.with(|c| c.borrow_mut().insert(key, v.clone()));
     v
 }

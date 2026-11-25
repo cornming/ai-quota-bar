@@ -39,6 +39,9 @@ use windows_sys::w;
 
 const WM_APP_DATA: u32 = WM_APP + 1;
 const TIMER_PLACE: usize = 1;
+const TIMER_ANIM: usize = 2;
+/// 光澤掃過一次的時間。
+const SHEEN_MS: f32 = 900.0;
 const CMD_REFRESH: usize = 1;
 const CMD_TOGGLE_BASE: usize = 10;
 const CMD_AUTOSTART: usize = 20;
@@ -48,6 +51,8 @@ const CMD_COPILOT_BASE: usize = 100;
 const CMD_MONITOR_BASE: usize = 200;
 const CMD_TOGGLE_WIDGET: usize = 22;
 const CMD_SHOW_REMAINING: usize = 23;
+const CMD_THEME_BASE: usize = 300;
+const THEME_NAMES: [&str; 3] = ["跟隨系統", "深色", "淺色"];
 const WM_APP_TRAY: u32 = WM_APP + 2;
 const TRAY_ID: u32 = 1;
 
@@ -108,11 +113,12 @@ fn spawn_worker(p: Provider) -> Sender<()> {
             let mut wait = base;
             if !HIDDEN[p.index()].load(Ordering::Relaxed) {
                 let r = p.fetch();
+                let ok = r.is_ok();
                 let stop = matches!(r, Err(FetchError::Disabled(_)));
                 streak = if matches!(r, Err(FetchError::RateLimited(_))) { streak + 1 } else { 0 };
                 wait = backoff_secs(base, streak);
                 store(p, r, (streak > 0).then(|| now_secs() + wait as i64));
-                notify();
+                notify(ok);
                 if stop {
                     return;
                 }
@@ -136,10 +142,11 @@ fn spawn_worker(p: Provider) -> Sender<()> {
     tx
 }
 
-fn notify() {
+/// 通知 UI 執行緒有新結果；`updated` 為 true 表示查詢成功，要播放光澤動畫。
+fn notify(updated: bool) {
     let ctl = CTL.load(Ordering::Relaxed);
     if ctl != 0 {
-        unsafe { PostMessageW(ctl as HWND, WM_APP_DATA, 0, 0) };
+        unsafe { PostMessageW(ctl as HWND, WM_APP_DATA, updated as usize, 0) };
     }
 }
 
@@ -155,6 +162,12 @@ struct Ui {
     dark: bool,
     hover: bool,
     rendered: Option<(render::Model, i32, u32)>,
+    /// 目前畫面（不含光澤），動畫時在它上面疊光帶。
+    base: Option<render::Frame>,
+    base_scale: f32,
+    base_light: bool,
+    /// 光澤動畫開始的時間；None 表示沒有在播放。
+    sheen_start: Option<std::time::Instant>,
     pos: (i32, i32, i32, i32),
     workers: Vec<Sender<()>>,
     /// 要顯示在哪個螢幕（裝置名稱）；None 為主螢幕。
@@ -163,6 +176,8 @@ struct Ui {
     widget_hidden: bool,
     /// 顯示剩餘百分比而不是已用。
     show_remaining: bool,
+    /// 主題：0 跟隨系統、1 深色、2 淺色。
+    theme: u32,
 }
 
 thread_local! {
@@ -320,7 +335,7 @@ fn tooltip_text() -> String {
 
 // ---------- 工作列上的內容 ----------
 
-fn build_model(dark: bool, hover: bool, show_remaining: bool) -> render::Model {
+fn build_model(dark: bool, light: bool, hover: bool, show_remaining: bool) -> render::Model {
     let mut blocks = Vec::new();
     for p in ALL {
         if HIDDEN[p.index()].load(Ordering::Relaxed) {
@@ -363,7 +378,7 @@ fn build_model(dark: bool, hover: bool, show_remaining: bool) -> render::Model {
             stale: true,
         });
     }
-    render::Model { blocks, dark, hover, show_remaining }
+    render::Model { blocks, dark, light, hover, show_remaining }
 }
 
 unsafe fn present(widget: HWND, f: &render::Frame) {
@@ -479,8 +494,14 @@ fn ensure_widget() {
         let dpi = GetDpiForWindow(taskbar).max(96);
         let scale = dpi as f32 / 96.0;
 
-        let (dark, hover, show_remaining) = with(|u| (u.dark, u.hover, u.show_remaining));
-        let model = build_model(dark, hover, show_remaining);
+        let (dark, hover, show_remaining, theme) = with(|u| (u.dark, u.hover, u.show_remaining, u.theme));
+        // 跟隨系統：工作列是淺色就用淺色面板。
+        let light = match theme {
+            1 => false,
+            2 => true,
+            _ => !dark,
+        };
+        let model = build_model(dark, light, hover, show_remaining);
         let key = (model.clone(), h, dpi);
         let needs = with(|u| u.rendered.as_ref() != Some(&key));
         let (mut w, mut wh) = with(|u| (u.pos.2, u.pos.3));
@@ -488,8 +509,16 @@ fn ensure_widget() {
             let frame = render::render(&model, h, scale);
             w = frame.w;
             wh = frame.h;
-            present(widget, &frame);
-            with(|u| u.rendered = Some(key));
+            // 動畫播放中由 animate_tick 負責畫，這裡只更新底圖。
+            if with(|u| u.sheen_start.is_none()) {
+                present(widget, &frame);
+            }
+            with(|u| {
+                u.rendered = Some(key);
+                u.base = Some(frame);
+                u.base_scale = scale;
+                u.base_light = light;
+            });
         }
         let gap = (2.0 * scale) as i32;
         let pos = if vertical {
@@ -505,6 +534,46 @@ fn ensure_widget() {
         let on_top = GetWindow(taskbar, GW_CHILD) == widget;
         if moved || !on_top || IsWindowVisible(widget) == 0 {
             SetWindowPos(widget, HWND_TOP, pos.0, pos.1, pos.2, pos.3, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        }
+    }
+}
+
+/// 開始播放光澤動畫（有新資料時）。
+fn start_sheen() {
+    let (ctl, hidden, ready) = with(|u| (u.ctl, u.widget_hidden, u.base.is_some() && !u.widget.is_null()));
+    if hidden || !ready {
+        return;
+    }
+    with(|u| u.sheen_start = Some(std::time::Instant::now()));
+    unsafe { SetTimer(ctl, TIMER_ANIM, 16, None) };
+}
+
+/// 動畫的每一格：在底圖上疊一道光帶；播完就停掉計時器、畫回底圖。
+fn animate_tick() {
+    let (ctl, widget, start, scale, light) = with(|u| (u.ctl, u.widget, u.sheen_start, u.base_scale, u.base_light));
+    let Some(start) = start else {
+        unsafe { KillTimer(ctl, TIMER_ANIM) };
+        return;
+    };
+    let t = start.elapsed().as_secs_f32() * 1000.0 / SHEEN_MS;
+    unsafe {
+        if widget.is_null() || IsWindow(widget) == 0 {
+            with(|u| u.sheen_start = None);
+            KillTimer(ctl, TIMER_ANIM);
+            return;
+        }
+        if t >= 1.0 {
+            with(|u| u.sheen_start = None);
+            KillTimer(ctl, TIMER_ANIM);
+            if let Some(base) = with(|u| u.base.clone()) {
+                present(widget, &base);
+            }
+            return;
+        }
+        // 先慢後快再慢（ease-in-out）。
+        let e = t * t * (3.0 - 2.0 * t);
+        if let Some(frame) = with(|u| u.base.as_ref().map(|b| render::sheen(b, e, scale, light))) {
+            present(widget, &frame);
         }
     }
 }
@@ -635,6 +704,13 @@ unsafe fn show_menu() {
     }
     let hidden_now = with(|u| u.widget_hidden);
     add(CMD_SHOW_REMAINING, "顯示剩餘百分比", with(|u| u.show_remaining));
+    let theme_now = with(|u| u.theme) as usize;
+    let theme_menu = CreatePopupMenu();
+    for (i, name) in THEME_NAMES.iter().enumerate() {
+        let flags = MF_STRING | if i == theme_now { MF_CHECKED } else { MF_UNCHECKED };
+        AppendMenuW(theme_menu, flags, CMD_THEME_BASE + i, wide(name).as_ptr());
+    }
+    AppendMenuW(menu, MF_POPUP, theme_menu as usize, wide("主題").as_ptr());
     add(CMD_TOGGLE_WIDGET, if hidden_now { "顯示工作列小工具" } else { "隱藏工作列小工具" }, false);
     AppendMenuW(menu, MF_SEPARATOR, 0, null());
     add(CMD_OPEN_CLAUDE, "開啟 Claude 用量頁面", false);
@@ -659,6 +735,12 @@ unsafe fn show_menu() {
             DestroyWindow(ctl);
         }
         CMD_TOGGLE_WIDGET => toggle_widget(),
+        c if (CMD_THEME_BASE..CMD_THEME_BASE + THEME_NAMES.len()).contains(&c) => {
+            let t = (c - CMD_THEME_BASE) as u32;
+            with(|u| u.theme = t);
+            reg_set_dword(REG_APP, "Theme", t);
+            ensure_widget();
+        }
         CMD_SHOW_REMAINING => {
             let on = with(|u| {
                 u.show_remaining = !u.show_remaining;
@@ -708,7 +790,18 @@ unsafe fn show_menu() {
 unsafe extern "system" fn ctl_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     let created = UI.with(|u| u.borrow().as_ref().map(|u| u.taskbar_created));
     match m {
-        WM_APP_DATA | WM_TIMER => {
+        WM_APP_DATA => {
+            ensure_widget();
+            if wp == 1 {
+                start_sheen();
+            }
+            0
+        }
+        WM_TIMER if wp == TIMER_ANIM => {
+            animate_tick();
+            0
+        }
+        WM_TIMER => {
             ensure_widget();
             0
         }
@@ -893,11 +986,16 @@ fn main() {
                 dark: system_dark(),
                 hover: false,
                 rendered: None,
+                base: None,
+                base_scale: 1.0,
+                base_light: false,
+                sheen_start: None,
                 pos: (0, 0, 0, 0),
                 workers: Vec::new(),
                 monitor: reg_get_string(REG_APP, "Monitor"),
                 widget_hidden: reg_get_dword(HKEY_CURRENT_USER, REG_APP, "WidgetHidden") == Some(1),
                 show_remaining: reg_get_dword(HKEY_CURRENT_USER, REG_APP, "ShowRemaining") == Some(1),
+                theme: reg_get_dword(HKEY_CURRENT_USER, REG_APP, "Theme").filter(|v| *v <= 2).unwrap_or(0),
             })
         });
         CTL.store(ctl as isize, Ordering::Relaxed);
