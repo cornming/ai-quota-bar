@@ -157,8 +157,11 @@ struct Ui {
     ctl: HWND,
     taskbar: HWND,
     widget: HWND,
+    /// 自己畫的滑鼠提示視窗。
     tip: HWND,
-    tip_text: Vec<u16>,
+    tip_shown: bool,
+    /// 目前提示畫面（內容、倍率、主題）與陰影寬度，內容沒變就不重畫。
+    tip_drawn: Option<((Vec<render::TipLine>, u32, bool), render::Frame, i32)>,
     taskbar_created: u32,
     dark: bool,
     hover: bool,
@@ -291,7 +294,7 @@ fn local_time(ts: i64) -> String {
 }
 
 fn window_line(w: &Window, now: i64) -> String {
-    let mut s = format!("  {}：已用 {}（剩 {}）", w.name, fmt_pct(w.used), fmt_pct((100.0 - w.used).max(0.0)));
+    let mut s = format!("{}：已用 {}（剩 {}）", w.name, fmt_pct(w.used), fmt_pct((100.0 - w.used).max(0.0)));
     if let Some(d) = &w.detail {
         s += &format!("，{d}");
     }
@@ -303,7 +306,10 @@ fn window_line(w: &Window, now: i64) -> String {
     s
 }
 
-fn tooltip_text() -> String {
+/// 滑鼠提示的內容（每家一段）。
+fn tooltip_lines() -> Vec<render::TipLine> {
+    use render::{TipKind, TipLine};
+    let line = |kind, text: String, used| TipLine { kind, text, used };
     let now = now_secs();
     let mut lines = Vec::new();
     for p in ALL {
@@ -312,31 +318,46 @@ fn tooltip_text() -> String {
         }
         let s = slot(p);
         let plan = s.quota.as_ref().and_then(|q| q.plan.clone());
-        lines.push(match plan {
+        let title = match plan {
             Some(pl) => format!("{}（{pl}）", p.name()),
             None => p.name().to_string(),
-        });
+        };
+        lines.push(line(TipKind::Header, title, None));
         if !s.done {
-            lines.push("  查詢中…".into());
+            lines.push(line(TipKind::Note, "查詢中…".into(), None));
         }
         if let Some(q) = &s.quota {
             for w in q.windows.iter().chain(&q.extra) {
-                lines.push(window_line(w, now));
+                lines.push(line(TipKind::Body, window_line(w, now), Some(w.used)));
             }
         }
         if let Some(e) = &s.error {
-            match s.retry_at {
-                Some(t) => lines.push(format!("  ⚠ {}，{} 自動重試", e.message(), local_time(t))),
-                None => lines.push(format!("  ⚠ {}", e.message())),
-            }
+            let msg = match s.retry_at {
+                Some(t) => format!("⚠ {}，{} 自動重試", e.message(), local_time(t)),
+                None => format!("⚠ {}", e.message()),
+            };
+            lines.push(line(TipKind::Warn, msg, None));
             if let (Some(u), Some(_)) = (s.updated, &s.quota) {
-                lines.push(format!("  （顯示的是 {} 的資料）", local_time(u)));
+                lines.push(line(TipKind::Note, format!("（顯示的是 {} 的資料）", local_time(u)), None));
             }
         }
     }
-    lines.push(String::new());
-    lines.push("左鍵：立即更新　右鍵：選單".into());
-    lines.join("\r\n")
+    lines.push(line(TipKind::Footer, "左鍵：立即更新　右鍵：選單".into(), None));
+    lines
+}
+
+/// 純文字版（`--dump` 用）。
+fn tooltip_text() -> String {
+    use render::TipKind;
+    tooltip_lines()
+        .into_iter()
+        .map(|l| match l.kind {
+            TipKind::Header => l.text,
+            TipKind::Footer => format!("\r\n{}", l.text),
+            _ => format!("  {}", l.text),
+        })
+        .collect::<Vec<_>>()
+        .join("\r\n")
 }
 
 // ---------- 工作列上的內容 ----------
@@ -421,28 +442,77 @@ unsafe fn present(widget: HWND, f: &render::Frame) {
     DeleteDC(dc);
 }
 
-unsafe fn create_tooltip(widget: HWND) -> HWND {
-    let tip = CreateWindowExW(
-        WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
-        TOOLTIPS_CLASSW,
-        null(),
-        WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
-        CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
-        widget,
-        null_mut(),
-        GetModuleHandleW(null()),
-        null(),
-    );
-    let mut ti: TTTOOLINFOW = std::mem::zeroed();
-    ti.cbSize = std::mem::size_of::<TTTOOLINFOW>() as u32;
-    ti.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
-    ti.hwnd = widget;
-    ti.uId = widget as usize;
-    ti.lpszText = -1isize as *mut u16; // LPSTR_TEXTCALLBACKW
-    SendMessageW(tip, TTM_ADDTOOLW, 0, &ti as *const _ as LPARAM);
-    SendMessageW(tip, TTM_SETMAXTIPWIDTH, 0, 800);
-    SendMessageW(tip, TTM_SETDELAYTIME, TTDT_AUTOPOP as usize, 30_000);
-    tip
+// ---------- 滑鼠提示 ----------
+// 自己畫的分層視窗，跟小工具同一套主題；點擊會穿透，不搶焦點。
+
+/// 顯示提示（滑鼠停在小工具上一下子之後）。
+fn show_tip() {
+    with(|u| {
+        u.tip_shown = true;
+        u.tip_drawn = None;
+    });
+    update_tip();
+}
+
+fn hide_tip() {
+    let tip = with(|u| {
+        u.tip_shown = false;
+        u.tip
+    });
+    if !tip.is_null() {
+        unsafe { ShowWindow(tip, SW_HIDE) };
+    }
+}
+
+/// 提示顯示中時重畫（資料或倒數時間變了）並放到小工具旁邊。
+fn update_tip() {
+    let (tip, widget, shown, scale, light) = with(|u| (u.tip, u.widget, u.tip_shown, u.base_scale, u.base_light));
+    if !shown || tip.is_null() || widget.is_null() {
+        return;
+    }
+    unsafe {
+        if IsWindow(widget) == 0 || IsWindowVisible(widget) == 0 {
+            hide_tip();
+            return;
+        }
+        let lines = tooltip_lines();
+        let key = (lines.clone(), scale.to_bits(), light);
+        let cached = with(|u| u.tip_drawn.as_ref().map(|(k, _, _)| k == &key).unwrap_or(false));
+        if !cached {
+            let (frame, off) = render::tooltip(&lines, scale, light);
+            with(|u| u.tip_drawn = Some((key, frame, off)));
+        }
+        let Some((fw, fh, off)) = with(|u| u.tip_drawn.as_ref().map(|(_, f, o)| (f.w, f.h, *o))) else {
+            return;
+        };
+        let (card_w, card_h) = (fw - off * 2, fh - off * 2);
+        let mut wr: RECT = std::mem::zeroed();
+        GetWindowRect(widget, &mut wr);
+        let mon = MonitorFromWindow(widget, MONITOR_DEFAULTTONEAREST);
+        let mut mi: MONITORINFO = std::mem::zeroed();
+        mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        GetMonitorInfoW(mon, &mut mi);
+        let mr = mi.rcMonitor;
+        let mut cur = POINT { x: (wr.left + wr.right) / 2, y: 0 };
+        GetCursorPos(&mut cur);
+        let gap = (6.0 * scale) as i32;
+        let margin = (8.0 * scale) as i32;
+        // 工作列在上面就往下長，在下面就往上長。
+        let below = (wr.top + wr.bottom) / 2 < (mr.top + mr.bottom) / 2;
+        let cy = if below { wr.bottom + gap } else { wr.top - gap - card_h };
+        let cx = (cur.x - card_w / 2).min(mr.right - margin - card_w).max(mr.left + margin);
+        SetWindowPos(tip, HWND_TOPMOST, cx - off, cy - off, fw, fh, SWP_NOACTIVATE);
+        if !cached {
+            with(|u| {
+                if let Some((_, f, _)) = &u.tip_drawn {
+                    present(tip, f);
+                }
+            });
+        }
+        if IsWindowVisible(tip) == 0 {
+            ShowWindow(tip, SW_SHOWNOACTIVATE);
+        }
+    }
 }
 
 /// 建立（或在工作列重建、換螢幕後重建）嵌入視窗，放到系統匣（或副螢幕時鐘）左邊，內容有變才重畫。
@@ -453,6 +523,7 @@ fn ensure_widget() {
             if !widget.is_null() && IsWindow(widget) != 0 && IsWindowVisible(widget) != 0 {
                 ShowWindow(widget, SW_HIDE);
             }
+            hide_tip();
             return;
         }
         let Some(screen) = taskbar::find(with(|u| u.monitor.clone()).as_deref()) else {
@@ -478,11 +549,9 @@ fn ensure_widget() {
             if widget.is_null() {
                 return;
             }
-            let tip = create_tooltip(widget);
             with(|u| {
                 u.widget = widget;
                 u.taskbar = taskbar;
-                u.tip = tip;
                 u.rendered = None;
                 u.pos = (0, 0, 0, 0);
             });
@@ -816,6 +885,7 @@ unsafe extern "system" fn ctl_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
     match m {
         WM_APP_DATA => {
             ensure_widget();
+            update_tip();
             if wp == 1 {
                 start_sheen();
             }
@@ -827,11 +897,13 @@ unsafe extern "system" fn ctl_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
         }
         WM_TIMER => {
             ensure_widget();
+            update_tip();
             0
         }
         WM_SETTINGCHANGE => {
             with(|u| u.dark = system_dark());
             ensure_widget();
+            update_tip();
             0
         }
         WM_APP_TRAY => {
@@ -850,9 +922,12 @@ unsafe extern "system" fn ctl_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
         WM_DESTROY => {
             // 換 token 換到一半不能結束，否則新登入可能沒寫回檔案。
             claude_auth::wait_idle(std::time::Duration::from_secs(30));
-            let widget = with(|u| u.widget);
+            let (widget, tip) = with(|u| (u.widget, u.tip));
             if !widget.is_null() && IsWindow(widget) != 0 {
                 DestroyWindow(widget);
+            }
+            if !tip.is_null() {
+                DestroyWindow(tip);
             }
             tray_remove(h);
             PostQuitMessage(0);
@@ -874,19 +949,25 @@ unsafe extern "system" fn widget_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -
         WM_MOUSEMOVE => {
             if !with(|u| u.hover) {
                 with(|u| u.hover = true);
+                // 停一下（系統的懸停時間）才顯示提示，離開就收起來。
                 let mut tme = TRACKMOUSEEVENT {
                     cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
-                    dwFlags: TME_LEAVE,
+                    dwFlags: TME_LEAVE | TME_HOVER,
                     hwndTrack: h,
-                    dwHoverTime: 0,
+                    dwHoverTime: HOVER_DEFAULT,
                 };
                 TrackMouseEvent(&mut tme);
                 ensure_widget();
             }
             0
         }
+        WM_MOUSEHOVER => {
+            show_tip();
+            0
+        }
         WM_MOUSELEAVE => {
             with(|u| u.hover = false);
+            hide_tip();
             ensure_widget();
             0
         }
@@ -895,22 +976,19 @@ unsafe extern "system" fn widget_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -
             0
         }
         WM_RBUTTONUP => {
+            hide_tip();
             show_menu();
             0
         }
-        WM_NOTIFY => {
-            let hdr = &*(lp as *const NMHDR);
-            if hdr.code == TTN_GETDISPINFOW {
-                let info = &mut *(lp as *mut NMTTDISPINFOW);
-                let text = wide(&tooltip_text());
-                with(|u| {
-                    u.tip_text = text;
-                    info.lpszText = u.tip_text.as_mut_ptr();
-                });
-                return 0;
-            }
-            DefWindowProcW(h, m, wp, lp)
-        }
+        _ => DefWindowProcW(h, m, wp, lp),
+    }
+}
+
+unsafe extern "system" fn tip_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    match m {
+        // 點擊穿透：滑鼠永遠落到底下的視窗。
+        WM_NCHITTEST => HTTRANSPARENT as LRESULT,
+        WM_MOUSEACTIVATE => MA_NOACTIVATE as LRESULT,
         _ => DefWindowProcW(h, m, wp, lp),
     }
 }
@@ -978,6 +1056,7 @@ fn main() {
         for (name, proc_) in [
             (w!("AiQuotaBarCtl"), ctl_proc as unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT),
             (w!("AiQuotaBarWidget"), widget_proc),
+            (w!("AiQuotaBarTip"), tip_proc),
         ] {
             let wc = WNDCLASSW {
                 lpfnWndProc: Some(proc_),
@@ -1005,8 +1084,13 @@ fn main() {
                 ctl,
                 taskbar: null_mut(),
                 widget: null_mut(),
-                tip: null_mut(),
-                tip_text: vec![0],
+                tip: CreateWindowExW(
+                    WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+                    w!("AiQuotaBarTip"), w!("AI Quota Bar"), WS_POPUP,
+                    0, 0, 1, 1, null_mut(), null_mut(), hinst, null(),
+                ),
+                tip_shown: false,
+                tip_drawn: None,
                 taskbar_created: RegisterWindowMessageW(w!("TaskbarCreated")),
                 dark: system_dark(),
                 hover: false,

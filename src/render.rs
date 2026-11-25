@@ -551,6 +551,135 @@ pub fn render(m: &Model, h: i32, scale: f32) -> Frame {
     }
 }
 
+// ---------- 滑鼠提示 ----------
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum TipKind {
+    /// 每家的標題，例如「Claude（pro）」。
+    Header,
+    /// 一個額度視窗；`used` 決定行首狀態燈的顏色。
+    Body,
+    /// 次要說明，例如「查詢中…」。
+    Note,
+    /// 錯誤或限流訊息。
+    Warn,
+    /// 最下面的操作說明。
+    Footer,
+}
+
+#[derive(Clone, PartialEq, Debug)]
+pub struct TipLine {
+    pub kind: TipKind,
+    pub text: String,
+    pub used: Option<f64>,
+}
+
+/// 滑鼠提示卡片：和小工具同一套主題的 HUD 面板，外圍留一圈陰影。
+/// 回傳畫面與卡片在畫面裡的偏移（陰影寬度），放視窗時要扣掉。
+pub fn tooltip(lines: &[TipLine], scale: f32, light: bool) -> (Frame, i32) {
+    let s = |v: f32| (v * scale).round() as i32;
+    let f = |v: f32| v * scale;
+    let th = theme(light);
+    unsafe {
+        let body = TextMask::new(s(13.0), 400, "Microsoft JhengHei UI");
+        let head = TextMask::new(s(13.0), 700, "Microsoft JhengHei UI");
+        // 標題用比主題色淡一點的青色，比較好讀。
+        let head_c = if light { hex(0x07657F) } else { hex(0x8FE8FF) };
+        let (pad_x, pad_y) = (s(14.0), s(10.0));
+        let indent = s(16.0);
+        let line_h = s(20.0);
+        let section_gap = s(5.0);
+        let footer_gap = s(9.0);
+        let shadow = s(12.0);
+
+        let mut card_w = 0;
+        let mut card_h = pad_y * 2;
+        for (i, l) in lines.iter().enumerate() {
+            let w = match l.kind {
+                TipKind::Header => head.measure(&l.text).0,
+                TipKind::Footer => body.measure(&l.text).0,
+                _ => indent + body.measure(&l.text).0,
+            };
+            card_w = card_w.max(w);
+            card_h += line_h;
+            if i > 0 && l.kind == TipKind::Header {
+                card_h += section_gap;
+            }
+            if l.kind == TipKind::Footer {
+                card_h += footer_gap;
+            }
+        }
+        card_w += pad_x * 2;
+        let (w, h) = (card_w + shadow * 2, card_h + shadow * 2);
+        let mut cv = Canvas::new(w, h);
+        let (x0, y0, cw, ch) = (shadow as f32, shadow as f32, card_w as f32, card_h as f32);
+        let radius = f(7.0);
+
+        // 陰影：往外一圈圈變淡，往下偏一點。
+        let dy = f(3.0);
+        let n = shadow.max(1);
+        for k in 0..n {
+            let e = k as f32;
+            let a = 0.05 * (1.0 - e / n as f32).powi(2) * if light { 0.6 } else { 1.0 };
+            cv.rrect(x0 - e, y0 - e + dy, cw + 2.0 * e, ch + 2.0 * e, radius + e, hex(0x000000), a, None);
+        }
+        cv.rrect(x0, y0, cw, ch, radius, th.panel, 0.98, Some(th.panel_top));
+        cv.rrect_stroke(x0 + 0.5, y0 + 0.5, cw - 1.0, ch - 1.0, radius, 1.0, th.accent, th.border_alpha.1);
+        // 四角括號，跟小工具一樣。
+        let arm = s(8.0);
+        let t = s(1.5).max(1);
+        let (l, tp, r, b) = (x0 as i32, y0 as i32, (x0 + cw) as i32, (y0 + ch) as i32);
+        for (cx, cy, dx, dy) in [(l, tp, 1, 1), (r, tp, -1, 1), (l, b, 1, -1), (r, b, -1, -1)] {
+            let hx = if dx > 0 { cx } else { cx - arm };
+            let vy = if dy > 0 { cy } else { cy - arm };
+            let hy = if dy > 0 { cy } else { cy - t };
+            let vx = if dx > 0 { cx } else { cx - t };
+            cv.fill(hx, hy, arm, t, th.accent, 0.9);
+            cv.fill(vx, vy, t, arm, th.accent, 0.9);
+        }
+
+        let asc = body.ascent();
+        let (_, text_h) = body.measure("Ag");
+        let x = shadow + pad_x;
+        let mut y = shadow + pad_y;
+        for (i, ln) in lines.iter().enumerate() {
+            if i > 0 && ln.kind == TipKind::Header {
+                y += section_gap;
+            }
+            if ln.kind == TipKind::Footer {
+                y += footer_gap;
+                let sy = y - footer_gap / 2;
+                for xx in x..(shadow + card_w - pad_x) {
+                    cv.blend(xx, sy, th.accent, 0.25);
+                }
+            }
+            let base = y + (line_h - text_h) / 2 + asc;
+            match ln.kind {
+                TipKind::Header => head.draw(&mut cv, &ln.text, x, base, head_c, 1.0),
+                TipKind::Footer => body.draw(&mut cv, &ln.text, x, base, th.label, 1.0),
+                kind => {
+                    if let Some(u) = ln.used {
+                        let c = level_color(&th, u);
+                        let (dx, dy, dr) = ((x + indent / 2 - s(2.0)) as f32, (y + line_h / 2) as f32, f(3.0));
+                        if !light {
+                            cv.glow(dx - dr, dy - dr, dr * 2.0, dr * 2.0, f(4.0), c, 0.35);
+                        }
+                        cv.circle(dx, dy, dr, c, 1.0);
+                    }
+                    let c = match kind {
+                        TipKind::Warn => th.warn,
+                        TipKind::Note => th.label,
+                        _ => th.value,
+                    };
+                    body.draw(&mut cv, &ln.text, x + indent, base, c, if kind == TipKind::Body { 0.94 } else { 1.0 });
+                }
+            }
+            y += line_h;
+        }
+        (cv.into_frame(), shadow)
+    }
+}
+
 /// 更新時掃過的光澤：一道斜向的亮帶從左到右，`t` 是 0–1 的進度。
 /// 只加亮已經畫出來的像素（依原本的透明度），所以光不會跑到面板外面。
 /// 淺色面板上白光看不出來，改成一道淡淡的主題色光帶。
@@ -720,7 +849,26 @@ mod tests {
             }
             std::fs::write(format!("{dir}/{name}.raw"), out).unwrap();
         };
+        let tl = |kind, text: &str, used| TipLine { kind, text: text.into(), used };
+        let tip = vec![
+            tl(TipKind::Header, "Claude（pro）", None),
+            tl(TipKind::Body, "5 小時：已用 43%（剩 57%），16:40 重置（2 小時 10 分後）", Some(43.0)),
+            tl(TipKind::Body, "每週：已用 81%（剩 19%），11/28 08:00 重置（2 天 17 小時後）", Some(81.0)),
+            tl(TipKind::Header, "Codex（plus）", None),
+            tl(TipKind::Body, "5 小時：已用 12%（剩 88%），18:05 重置（3 小時 35 分後）", Some(12.0)),
+            tl(TipKind::Body, "每週：已用 35%（剩 65%），12/1 09:00 重置（5 天 18 小時後）", Some(35.0)),
+            tl(TipKind::Header, "Copilot（business）", None),
+            tl(TipKind::Body, "進階請求：已用 63%（剩 37%），剩 703 / 1900 次，12/1 08:00 重置（5 天 17 小時後）", Some(63.0)),
+            tl(TipKind::Header, "Antigravity", None),
+            tl(TipKind::Body, "Gemini Models（每週）：已用 18%（剩 82%），12/1 09:21 重置（5 天 18 小時後）", Some(18.0)),
+            tl(TipKind::Body, "Claude and GPT models（每週）：已用 93%（剩 7%），11/30 11:07 重置（4 天 20 小時後）", Some(93.0)),
+            tl(TipKind::Body, "Gemini Models（5 小時）：已用 2%（剩 98%），18:44 重置（4 小時 14 分後）", Some(2.0)),
+            tl(TipKind::Body, "Claude and GPT models（5 小時）：已用 0%（剩 100%），18:50 重置（4 小時 20 分後）", Some(0.0)),
+            tl(TipKind::Footer, "左鍵：立即更新　右鍵：選單", None),
+        ];
         for (light, name) in [(false, "dark"), (true, "light")] {
+            let tip_scale: f32 = std::env::var("TIP_SCALE").ok().and_then(|v| v.parse().ok()).unwrap_or(scale);
+            save(&tooltip(&tip, tip_scale, light).0, &format!("tip-{name}"));
             let m = Model { blocks: blocks.clone(), dark: !light, light, hover: true, show_remaining: false };
             let f = render(&m, (40.0 * scale).round() as i32, scale);
             save(&f, &format!("cover-{name}"));
