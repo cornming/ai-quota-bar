@@ -695,4 +695,36 @@ mod tests {
             }
         }
     }
+
+    /// 作品集封面用：`PREVIEW_DIR=<資料夾> cargo test --release cover -- --ignored`，
+    /// 以大倍率輸出小工具（和光澤掃到一半的版本），格式是 w、h（u32）後接預乘 BGRA。
+    #[test]
+    #[ignore]
+    fn cover() {
+        use crate::providers::Provider;
+        let dir = std::env::var("PREVIEW_DIR").expect("PREVIEW_DIR");
+        let scale: f32 = std::env::var("COVER_SCALE").ok().and_then(|v| v.parse().ok()).unwrap_or(2.25);
+        let row = |l: &str, u: f64| Row { label: l.into(), used: Some(u) };
+        let blocks = vec![
+            Block { provider: Some(Provider::Claude), name: "CLAUDE".into(), rows: vec![row("5H", 43.0), row("7D", 81.0)], stale: false },
+            Block { provider: Some(Provider::Codex), name: "CODEX".into(), rows: vec![row("5H", 12.0), row("7D", 35.0)], stale: false },
+            Block { provider: Some(Provider::Copilot), name: "COPILOT".into(), rows: vec![row("PREM", 63.0)], stale: false },
+            Block { provider: Some(Provider::Antigravity), name: "AGY".into(), rows: vec![row("GEM", 18.0), row("C+G", 93.0)], stale: false },
+        ];
+        let save = |f: &Frame, name: &str| {
+            let mut out = Vec::new();
+            out.extend((f.w as u32).to_le_bytes());
+            out.extend((f.h as u32).to_le_bytes());
+            for p in &f.px {
+                out.extend(p);
+            }
+            std::fs::write(format!("{dir}/{name}.raw"), out).unwrap();
+        };
+        for (light, name) in [(false, "dark"), (true, "light")] {
+            let m = Model { blocks: blocks.clone(), dark: !light, light, hover: true, show_remaining: false };
+            let f = render(&m, (40.0 * scale).round() as i32, scale);
+            save(&f, &format!("cover-{name}"));
+            save(&sheen(&f, 0.42, scale, light), &format!("cover-{name}-sheen"));
+        }
+    }
 }
