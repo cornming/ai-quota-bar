@@ -1,0 +1,61 @@
+# AI Quota Bar
+
+在 Windows 工作列時鐘旁，一眼看到各家 AI 訂閱還剩多少額度。
+
+```
+Claude 5h 28%   Codex 月 0%   Copilot 聊天 0%   AG Gem 41%
+       週 32%                         補全 0%      C+G 51%
+```
+
+- 支援 **Claude**（5 小時、每週）、**Codex**（依方案的 5 小時／每週／30 天）、**GitHub Copilot**（每月聊天、補全、進階請求）、**Antigravity**（Gemini 與 Claude/GPT 兩組，各取較緊的一個）。
+- 直接讀各工具已經存好的登入資料，不用另外輸入帳號密碼或 API key。唯一會寫回的是 Claude 的登入檔（見下方「Claude 登入自動更新」），其他家只讀不寫。
+- 單一 EXE（約 350 KB），沒有任何遙測，資料只送往各家官方伺服器。
+- 用量 75% 以上變橘、90% 以上變紅；資料過期時淡化顯示。
+
+## 使用方式
+
+| 操作 | 效果 |
+| --- | --- |
+| 滑鼠移到上面 | 顯示每一個額度的詳細用量與重置時間 |
+| 左鍵 | 立即更新 |
+| 右鍵 | 選單：立即更新、顯示／隱藏各家、開啟 Claude 用量頁面、開機時自動啟動、結束 |
+
+自動更新間隔：Claude、Codex、Copilot 每 2 分鐘；Antigravity 每 10 分鐘（每次要啟動 CLI）。
+
+## 各家需要的登入
+
+| 服務 | 讀取來源 | 沒有的話 |
+| --- | --- | --- |
+| Claude | `%USERPROFILE%\.claude\.credentials.json`（Claude Code 登入訂閱帳號） | 執行 `claude` 登入 |
+| Codex | `%USERPROFILE%\.codex\auth.json`（Codex 用 ChatGPT 帳號登入） | 執行 `codex` 登入 |
+| Copilot | `gh auth token`（GitHub CLI） | 執行 `gh auth login` |
+| Antigravity | `%LOCALAPPDATA%\agy\bin\agy.exe -p /usage` | 安裝並登入 Antigravity CLI |
+
+找不到登入資料的那家不會出現在工作列上。
+
+## Claude 登入自動更新
+
+Claude 的登入憑證約 8 小時就過期。快到期（剩 5 分鐘內）或被伺服器拒絕時，本程式會照 Claude Code 自己的流程換新 token 並寫回 `.credentials.json`，所以不開 Claude Code 數字也會持續更新：
+
+- 先取得 Claude Code 用的同一組目錄鎖（`.claude\.oauth_refresh.lock` 與 `.claude.lock`）；Claude Code 正在換就不動，下次再試。
+- 在鎖內重新讀檔，別人剛換過就直接沿用，不重複換。
+- 只改 `claudeAiOauth` 裡的 token、到期時間與 scope，其他內容（MCP 登入等）原樣保留；先寫暫存檔再整個取代，失敗會重試，仍失敗就保留暫存檔。
+- 換 token 被拒（refresh token 失效）時不動檔案，提示執行 `claude` 重新登入。
+- 結束程式或登出時，會等進行中的更新做完。
+
+## 已知限制
+
+- 用的都是各家**非官方**的內部 API，廠商一改就可能失效。
+- 查不到新資料時，數字會淡化；已過重置時間的數字改顯示「–」。
+- Antigravity：若 CLI 沒把 `/usage` 當指令處理（會變成一般提問、消耗額度），程式會立刻停用 Antigravity，重開程式才會再試。
+- 只顯示在主螢幕的工作列；Windows 11 沒有正式的工作列小工具 API，這裡是把視窗嵌進工作列，Windows 大改版後可能需要調整。
+
+## 開發
+
+```powershell
+cargo test
+cargo build --release
+.\target\release\ai-quota-bar.exe --dump quota.txt   # 查一次，把提示文字寫到檔案
+```
+
+`fixtures/` 是實際 API 回應（已去除帳號資訊），給解析測試用。
