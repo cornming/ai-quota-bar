@@ -34,6 +34,8 @@ pub enum FetchError {
     LoginExpired(String),
     /// 為了避免誤用額度而停用，直到程式重開。
     Disabled(String),
+    /// 伺服器說查詢太頻繁（HTTP 429）；查詢會自動放慢。
+    RateLimited(String),
     /// 其他暫時性錯誤（網路、伺服器）。
     Other(String),
 }
@@ -44,9 +46,19 @@ impl FetchError {
             FetchError::NotSetUp(m)
             | FetchError::LoginExpired(m)
             | FetchError::Disabled(m)
+            | FetchError::RateLimited(m)
             | FetchError::Other(m) => m,
         }
     }
+}
+
+/// 連續被限流 `streak` 次後，下次查詢要等多久（秒）：每次加倍，最長 30 分鐘。
+pub fn backoff_secs(base: u64, streak: u32) -> u64 {
+    const MAX: u64 = 30 * 60;
+    if streak == 0 {
+        return base;
+    }
+    base.saturating_mul(1u64 << streak.min(16)).min(MAX).max(base)
 }
 
 /// 使用量的嚴重程度，決定顏色。
@@ -177,6 +189,16 @@ mod tests {
         assert_eq!(window_label(604800).0, "7D");
         assert_eq!(window_label(2592000), ("30D".into(), "30 天".into()));
         assert_eq!(window_label(3600).0, "1H");
+    }
+
+    #[test]
+    fn backoff_doubles_up_to_30_minutes() {
+        assert_eq!(backoff_secs(300, 0), 300);
+        assert_eq!(backoff_secs(300, 1), 600);
+        assert_eq!(backoff_secs(300, 2), 1200);
+        assert_eq!(backoff_secs(300, 3), 1800);
+        assert_eq!(backoff_secs(300, 40), 1800);
+        assert_eq!(backoff_secs(2400, 1), 2400, "本來就比上限長時維持原間隔");
     }
 
     #[test]

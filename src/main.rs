@@ -65,6 +65,8 @@ struct Slot {
     updated: Option<i64>,
     /// 已經查過至少一次（成功或失敗）。
     done: bool,
+    /// 被限流時，下次自動重試的時間。
+    retry_at: Option<i64>,
 }
 
 static SLOTS: Mutex<[Option<Slot>; 4]> = Mutex::new([None, None, None, None]);
@@ -75,10 +77,11 @@ fn slot(p: Provider) -> Slot {
     SLOTS.lock().unwrap()[p.index()].clone().unwrap_or_default()
 }
 
-fn store(p: Provider, r: Result<Quota, FetchError>) {
+fn store(p: Provider, r: Result<Quota, FetchError>, retry_at: Option<i64>) {
     let mut slots = SLOTS.lock().unwrap();
     let s = slots[p.index()].get_or_insert_with(Slot::default);
     s.done = true;
+    s.retry_at = retry_at;
     match r {
         Ok(q) => {
             s.quota = Some(q);
@@ -97,20 +100,37 @@ fn store(p: Provider, r: Result<Quota, FetchError>) {
 
 fn spawn_worker(p: Provider) -> Sender<()> {
     let (tx, rx) = channel::<()>();
-    std::thread::spawn(move || loop {
-        if !HIDDEN[p.index()].load(Ordering::Relaxed) {
-            let r = p.fetch();
-            let stop = matches!(r, Err(FetchError::Disabled(_)));
-            store(p, r);
-            notify();
-            if stop {
-                return;
+    std::thread::spawn(move || {
+        let base = p.interval().as_secs();
+        // 連續被限流的次數；被限流時等待時間加倍，期間也不理會手動更新，免得越查越久。
+        let mut streak = 0u32;
+        loop {
+            let mut wait = base;
+            if !HIDDEN[p.index()].load(Ordering::Relaxed) {
+                let r = p.fetch();
+                let stop = matches!(r, Err(FetchError::Disabled(_)));
+                streak = if matches!(r, Err(FetchError::RateLimited(_))) { streak + 1 } else { 0 };
+                wait = backoff_secs(base, streak);
+                store(p, r, (streak > 0).then(|| now_secs() + wait as i64));
+                notify();
+                if stop {
+                    return;
+                }
             }
-        }
-        match rx.recv_timeout(p.interval()) {
-            Ok(()) => while rx.try_recv().is_ok() {},
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => return,
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait);
+            loop {
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                match rx.recv_timeout(left) {
+                    Ok(()) => {
+                        while rx.try_recv().is_ok() {}
+                        if streak == 0 {
+                            break;
+                        }
+                    }
+                    Err(RecvTimeoutError::Timeout) => break,
+                    Err(RecvTimeoutError::Disconnected) => return,
+                }
+            }
         }
     });
     tx
@@ -284,7 +304,10 @@ fn tooltip_text() -> String {
             }
         }
         if let Some(e) = &s.error {
-            lines.push(format!("  ⚠ {}", e.message()));
+            match s.retry_at {
+                Some(t) => lines.push(format!("  ⚠ {}，{} 自動重試", e.message(), local_time(t))),
+                None => lines.push(format!("  ⚠ {}", e.message())),
+            }
             if let (Some(u), Some(_)) = (s.updated, &s.quota) {
                 lines.push(format!("  （顯示的是 {} 的資料）", local_time(u)));
             }
@@ -812,7 +835,7 @@ fn debug_force_claude_refresh(report: &str) {
 fn dump(path: &str) {
     providers::set_copilot_login(reg_get_string(REG_APP, "CopilotAccount"));
     for p in ALL {
-        store(p, p.fetch());
+        store(p, p.fetch(), None);
     }
     let _ = std::fs::write(path, tooltip_text());
 }

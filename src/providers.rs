@@ -44,6 +44,8 @@ impl Provider {
     pub fn interval(self) -> Duration {
         match self {
             Provider::Antigravity => Duration::from_secs(600),
+            // Claude 的用量 API 限流比較嚴（Claude Code 自己也會查），間隔拉長。
+            Provider::Claude => Duration::from_secs(300),
             _ => Duration::from_secs(120),
         }
     }
@@ -79,7 +81,7 @@ fn read_json(path: &PathBuf) -> Option<Value> {
 fn http_error(who: &str, status: u32, body: &str) -> FetchError {
     match status {
         401 | 403 => FetchError::LoginExpired(format!("{who} 登入已過期，開啟 {who} 後會自動恢復")),
-        429 => FetchError::Other(format!("{who} 查詢太頻繁，稍後再試")),
+        429 => FetchError::RateLimited(format!("{who} 查詢太頻繁，已自動放慢")),
         s => FetchError::Other(format!("{who} 回應錯誤（HTTP {s}）{}", body.chars().take(80).collect::<String>())),
     }
 }
@@ -516,6 +518,13 @@ mod tests {
         assert_eq!(shorts, ["CHAT", "CODE"]);
         assert!((q.windows[0].used - 0.3).abs() < 1e-9);
         assert_eq!(q.windows[0].resets_at, parse_time("2026-12-01"));
+    }
+
+    #[test]
+    fn http_429_is_rate_limited() {
+        assert!(matches!(http_error("Claude", 429, ""), FetchError::RateLimited(_)));
+        assert!(matches!(http_error("Claude", 401, ""), FetchError::LoginExpired(_)));
+        assert!(matches!(http_error("Claude", 500, "x"), FetchError::Other(_)));
     }
 
     #[test]
