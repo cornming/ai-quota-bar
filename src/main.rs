@@ -47,6 +47,7 @@ const CMD_EXIT: usize = 30;
 const CMD_COPILOT_BASE: usize = 100;
 const CMD_MONITOR_BASE: usize = 200;
 const CMD_TOGGLE_WIDGET: usize = 22;
+const CMD_SHOW_REMAINING: usize = 23;
 const WM_APP_TRAY: u32 = WM_APP + 2;
 const TRAY_ID: u32 = 1;
 
@@ -140,6 +141,8 @@ struct Ui {
     monitor: Option<String>,
     /// 使用者把小工具整個隱藏了（從系統匣圖示再叫出來）。
     widget_hidden: bool,
+    /// 顯示剩餘百分比而不是已用。
+    show_remaining: bool,
 }
 
 thread_local! {
@@ -247,9 +250,9 @@ fn local_time(ts: i64) -> String {
 }
 
 fn window_line(w: &Window, now: i64) -> String {
-    let mut s = format!("  {}：已用 {}", w.name, fmt_pct(w.used));
+    let mut s = format!("  {}：已用 {}（剩 {}）", w.name, fmt_pct(w.used), fmt_pct((100.0 - w.used).max(0.0)));
     if let Some(d) = &w.detail {
-        s += &format!("（{d}）");
+        s += &format!("，{d}");
     }
     match w.resets_at {
         Some(r) if r <= now => s += &format!("，已在 {} 重置，等待新資料", local_time(r)),
@@ -294,7 +297,7 @@ fn tooltip_text() -> String {
 
 // ---------- 工作列上的內容 ----------
 
-fn build_model(dark: bool, hover: bool) -> render::Model {
+fn build_model(dark: bool, hover: bool, show_remaining: bool) -> render::Model {
     let mut blocks = Vec::new();
     for p in ALL {
         if HIDDEN[p.index()].load(Ordering::Relaxed) {
@@ -337,7 +340,7 @@ fn build_model(dark: bool, hover: bool) -> render::Model {
             stale: true,
         });
     }
-    render::Model { blocks, dark, hover }
+    render::Model { blocks, dark, hover, show_remaining }
 }
 
 unsafe fn present(widget: HWND, f: &render::Frame) {
@@ -453,8 +456,8 @@ fn ensure_widget() {
         let dpi = GetDpiForWindow(taskbar).max(96);
         let scale = dpi as f32 / 96.0;
 
-        let (dark, hover) = with(|u| (u.dark, u.hover));
-        let model = build_model(dark, hover);
+        let (dark, hover, show_remaining) = with(|u| (u.dark, u.hover, u.show_remaining));
+        let model = build_model(dark, hover, show_remaining);
         let key = (model.clone(), h, dpi);
         let needs = with(|u| u.rendered.as_ref() != Some(&key));
         let (mut w, mut wh) = with(|u| (u.pos.2, u.pos.3));
@@ -608,6 +611,7 @@ unsafe fn show_menu() {
         AppendMenuW(menu, MF_POPUP, sub as usize, wide("顯示在").as_ptr());
     }
     let hidden_now = with(|u| u.widget_hidden);
+    add(CMD_SHOW_REMAINING, "顯示剩餘百分比", with(|u| u.show_remaining));
     add(CMD_TOGGLE_WIDGET, if hidden_now { "顯示工作列小工具" } else { "隱藏工作列小工具" }, false);
     AppendMenuW(menu, MF_SEPARATOR, 0, null());
     add(CMD_OPEN_CLAUDE, "開啟 Claude 用量頁面", false);
@@ -632,6 +636,14 @@ unsafe fn show_menu() {
             DestroyWindow(ctl);
         }
         CMD_TOGGLE_WIDGET => toggle_widget(),
+        CMD_SHOW_REMAINING => {
+            let on = with(|u| {
+                u.show_remaining = !u.show_remaining;
+                u.show_remaining
+            });
+            reg_set_dword(REG_APP, "ShowRemaining", on as u32);
+            ensure_widget();
+        }
         c if c >= CMD_MONITOR_BASE && c - CMD_MONITOR_BASE < screens.len() => {
             let device = screens[c - CMD_MONITOR_BASE].device.clone();
             reg_set_string(REG_APP, "Monitor", &device);
@@ -862,6 +874,7 @@ fn main() {
                 workers: Vec::new(),
                 monitor: reg_get_string(REG_APP, "Monitor"),
                 widget_hidden: reg_get_dword(HKEY_CURRENT_USER, REG_APP, "WidgetHidden") == Some(1),
+                show_remaining: reg_get_dword(HKEY_CURRENT_USER, REG_APP, "ShowRemaining") == Some(1),
             })
         });
         CTL.store(ctl as isize, Ordering::Relaxed);

@@ -69,6 +69,8 @@ pub struct Model {
     /// 工作列是深色。面板本身固定深色，淺色工作列時加一圈外框陰影讓面板浮起來。
     pub dark: bool,
     pub hover: bool,
+    /// 顯示剩餘百分比（進度條也改成剩下多少），顏色仍依已用程度。
+    pub show_remaining: bool,
 }
 
 pub struct Frame {
@@ -456,7 +458,8 @@ pub fn render(m: &Model, h: i32, scale: f32) -> Frame {
                 // LED 分段條。
                 let bx = cx + lay.label_w + col_gap;
                 let by = rc - seg_h / 2;
-                let lit = r.used.map_or(0, |u| ((u.clamp(0.0, 100.0) / 100.0) * SEGMENTS as f64).ceil() as i32);
+                let shown = r.used.map(|u| if m.show_remaining { 100.0 - u.clamp(0.0, 100.0) } else { u.clamp(0.0, 100.0) });
+                let lit = shown.map_or(0, |v| ((v / 100.0) * SEGMENTS as f64).ceil() as i32);
                 let color = r.used.map_or(IDLE, level_color);
                 for k in 0..SEGMENTS {
                     let sx = bx + k * (seg_w + seg_gap);
@@ -469,7 +472,7 @@ pub fn render(m: &Model, h: i32, scale: f32) -> Frame {
                         cv.fill(sx, by, seg_w, seg_h, SEG_OFF, a);
                     }
                 }
-                let vt = value_text(r.used);
+                let vt = value_text(shown);
                 let vcol = match r.used {
                     Some(u) if level(u) != Level::Normal => level_color(u),
                     _ => VALUE,
