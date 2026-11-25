@@ -111,6 +111,17 @@ fn claude_usage(token: &str) -> Result<(u32, String), FetchError> {
     .map_err(FetchError::Other)
 }
 
+static LAST_FORCED_REFRESH: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+
+fn may_force_refresh() -> bool {
+    let mut last = LAST_FORCED_REFRESH.lock().unwrap();
+    if last.is_some_and(|t| t.elapsed() < Duration::from_secs(30 * 60)) {
+        return false;
+    }
+    *last = Some(Instant::now());
+    true
+}
+
 /// 讀 Claude Code 的登入；快到期或被拒絕時，照 Claude Code 的流程更新登入再查一次。
 fn claude() -> Result<Quota, FetchError> {
     let dir = claude_dir();
@@ -122,7 +133,9 @@ fn claude() -> Result<Quota, FetchError> {
         creds.access
     };
     let (mut status, mut body) = claude_usage(&token)?;
-    if status == 401 {
+    // 被拒絕時強制換一次 token；但如果換完還是被拒，30 分鐘內不再強制換，
+    // 免得伺服器端有別的問題時每 2 分鐘就輪替一次登入。
+    if status == 401 && may_force_refresh() {
         token = claude_auth::refresh(&dir, Some(&token), &claude_auth::post_token)?;
         (status, body) = claude_usage(&token)?;
     }
@@ -219,8 +232,17 @@ fn quiet(cmd: &mut Command) -> &mut Command {
 /// 使用者選的 Copilot 帳號（gh 登入的 github.com 帳號名稱）；None 表示用 gh 目前的帳號。
 static COPILOT_LOGIN: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
+/// GitHub 帳號名稱只能有英數字、`-`、`_`（企業帳號），而且不能以 `-` 開頭。
+/// 登錄檔裡的值會當成 gh 的參數，先擋掉不合格的，避免被當成其他選項。
+pub fn valid_login(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 100
+        && !s.starts_with('-')
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
 pub fn set_copilot_login(login: Option<String>) {
-    *COPILOT_LOGIN.lock().unwrap() = login;
+    *COPILOT_LOGIN.lock().unwrap() = login.filter(|l| valid_login(l));
 }
 
 pub fn copilot_login() -> Option<String> {
@@ -249,8 +271,8 @@ pub fn parse_gh_accounts(json: &str) -> Vec<(String, bool)> {
 fn gh_token(login: Option<&str>) -> Result<String, FetchError> {
     let mut cmd = Command::new("gh");
     cmd.args(["auth", "token", "--hostname", "github.com"]);
-    if let Some(l) = login {
-        cmd.args(["--user", l]);
+    if let Some(l) = login.filter(|l| valid_login(l)) {
+        cmd.arg(format!("--user={l}"));
     }
     let out = quiet(&mut cmd)
         .output()
@@ -494,6 +516,17 @@ mod tests {
         assert_eq!(shorts, ["CHAT", "CODE"]);
         assert!((q.windows[0].used - 0.3).abs() < 1e-9);
         assert_eq!(q.windows[0].resets_at, parse_time("2026-12-01"));
+    }
+
+    #[test]
+    fn rejects_suspicious_logins() {
+        assert!(valid_login("cornming"));
+        assert!(valid_login("me_work"));
+        assert!(valid_login("some-user"));
+        assert!(!valid_login("--hostname=evil.example"));
+        assert!(!valid_login("a b"));
+        assert!(!valid_login("x\"&calc"));
+        assert!(!valid_login(""));
     }
 
     #[test]
