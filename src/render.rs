@@ -26,12 +26,12 @@ const NEON: Rgb = hex(0x00E5FF);
 const WARN: Rgb = hex(0xFFB020);
 const CRIT: Rgb = hex(0xFF2E63);
 const NAME: Rgb = hex(0xBDF6FF);
-const LABEL: Rgb = hex(0x4F7A8C);
-const VALUE: Rgb = hex(0xE8FBFF);
-const SEG_OFF: Rgb = hex(0x13303C);
-const IDLE: Rgb = hex(0x55636B);
+const LABEL: Rgb = hex(0xA6D4E4);
+const VALUE: Rgb = hex(0xFFFFFF);
+const SEG_OFF: Rgb = hex(0x1C3A48);
+const IDLE: Rgb = hex(0x76858D);
 /// 資料過期時內容的透明度。
-const STALE: f32 = 0.4;
+const STALE: f32 = 0.55;
 /// LED 進度條的格數。
 const SEGMENTS: i32 = 8;
 
@@ -58,16 +58,16 @@ pub fn theme(light: bool) -> Theme {
         Theme {
             panel: hex(0xE8F0F5),
             panel_top: hex(0xFAFCFE),
-            panel_alpha: 0.97,
+            panel_alpha: 1.0,
             accent: hex(0x0A8FB0),
             warn: hex(0xC46A00),
             crit: hex(0xD21A48),
             name: hex(0x0B3A4A),
-            label: hex(0x5F7C8A),
-            value: hex(0x0E1A24),
-            seg_off: hex(0xCFDDE5),
-            idle: hex(0x9AA9B1),
-            scan_alpha: 0.025,
+            label: hex(0x2A4552),
+            value: hex(0x000000),
+            seg_off: hex(0xC2D2DB),
+            idle: hex(0x7A8A93),
+            scan_alpha: 0.015,
             border_alpha: (0.40, 0.75),
             glow_alpha: 0.12,
         }
@@ -75,7 +75,7 @@ pub fn theme(light: bool) -> Theme {
         Theme {
             panel: PANEL,
             panel_top: PANEL_TOP,
-            panel_alpha: 0.94,
+            panel_alpha: 1.0,
             accent: NEON,
             warn: WARN,
             crit: CRIT,
@@ -84,7 +84,7 @@ pub fn theme(light: bool) -> Theme {
             value: VALUE,
             seg_off: SEG_OFF,
             idle: IDLE,
-            scan_alpha: 0.035,
+            scan_alpha: 0.02,
             border_alpha: (0.22, 0.55),
             glow_alpha: 0.22,
         }
@@ -341,7 +341,8 @@ impl TextMask {
             for xx in 0..tw {
                 let p = data[(yy * tw + xx) as usize];
                 let cov = (p[0] as f32 + p[1] as f32 + p[2] as f32) / (3.0 * 255.0);
-                cv.blend(x + xx, y + yy, c, cov * alpha);
+                // 小字的灰階反鋸齒邊緣偏淡，加一點 gamma 讓筆畫實一點。
+                cv.blend(x + xx, y + yy, c, cov.powf(0.7) * alpha);
             }
         }
         SelectObject(self.dc, old);
@@ -386,8 +387,8 @@ pub fn render(m: &Model, h: i32, scale: f32) -> Frame {
     let th = theme(m.light);
     unsafe {
         let name_font = TextMask::new(s(9.5), 600, "Bahnschrift");
-        let label_font = TextMask::new(s(8.5), 400, "Cascadia Mono");
-        let value_font = TextMask::new(s(9.5), 600, "Cascadia Mono");
+        let label_font = TextMask::new(s(10.0), 600, "Cascadia Mono");
+        let value_font = TextMask::new(s(11.0), 700, "Cascadia Mono");
 
         let pad_x = s(8.0);
         let dot_gap = s(4.0);
@@ -428,7 +429,7 @@ pub fn render(m: &Model, h: i32, scale: f32) -> Frame {
         let mut cv = Canvas::new(total.max(1), h.max(1));
 
         // 面板：上下各留一點，讓工作列看得出這是一塊浮起來的 HUD。
-        let my = f(3.0);
+        let my = f(2.0);
         let (px0, py0, pw, ph) = (f(1.0), my, total as f32 - f(2.0), h as f32 - my * 2.0);
         let radius = f(5.0);
         if !m.dark {
@@ -463,7 +464,7 @@ pub fn render(m: &Model, h: i32, scale: f32) -> Frame {
         // 內容。
         let mid = h / 2;
         let value_asc = value_font.ascent();
-        let row_pitch = s(13.0);
+        let row_pitch = s(14.5);
         let mut x = pad_x;
         for (i, (b, lay)) in m.blocks.iter().zip(&lays).enumerate() {
             if i > 0 {
@@ -643,5 +644,55 @@ mod tests {
         assert_eq!(sheen(&base, 0.0, 1.0, false).px, base.px);
         assert_eq!(sheen(&base, 1.0, 1.0, false).px, base.px);
         assert_eq!(sheen(&base, 1.0, 1.0, true).px, base.px);
+    }
+
+    /// 預覽用：`PREVIEW_DIR=<資料夾> cargo test --release preview -- --ignored`，
+    /// 把深淺色兩種主題疊在工作列底色上存成 BMP。
+    #[test]
+    #[ignore]
+    fn preview() {
+        use crate::providers::Provider;
+        let dir = std::env::var("PREVIEW_DIR").expect("PREVIEW_DIR");
+        let row = |l: &str, u: f64| Row { label: l.into(), used: Some(u) };
+        let blocks = vec![
+            Block { provider: Some(Provider::Claude), name: "CLAUDE".into(), rows: vec![row("5H", 36.0), row("7D", 78.0)], stale: false },
+            Block { provider: Some(Provider::Codex), name: "CODEX".into(), rows: vec![row("30D", 0.0)], stale: false },
+            Block { provider: Some(Provider::Copilot), name: "COPILOT".into(), rows: vec![row("PREM", 93.0)], stale: false },
+            Block { provider: Some(Provider::Antigravity), name: "AGY".into(), rows: vec![row("GEM", 23.0), row("C+G", 51.0)], stale: true },
+        ];
+        for (light, dark_bar, bg, name) in [(false, true, [0x1C, 0x1C, 0x1C], "dark"), (true, false, [0xEE, 0xEE, 0xEE], "light")] {
+            for scale in [1.0f32, 1.5] {
+                let h = (40.0 * scale) as i32;
+                let m = Model { blocks: blocks.clone(), dark: dark_bar, light, hover: false, show_remaining: false };
+                let f = render(&m, h, scale);
+                let (w, h) = (f.w + 20, f.h);
+                let mut out = Vec::new();
+                let row_len = (w * 3 + 3) & !3;
+                let size = 54 + row_len * h;
+                out.extend(b"BM");
+                out.extend((size as u32).to_le_bytes());
+                out.extend([0u8; 4]);
+                out.extend(54u32.to_le_bytes());
+                out.extend(40u32.to_le_bytes());
+                out.extend(w.to_le_bytes());
+                out.extend(h.to_le_bytes());
+                out.extend(1u16.to_le_bytes());
+                out.extend(24u16.to_le_bytes());
+                out.extend([0u8; 24]);
+                for y in (0..h).rev() {
+                    let start = out.len();
+                    for x in 0..w {
+                        let fx = x - 10;
+                        let px = if fx >= 0 && fx < f.w { f.px[(y * f.w + fx) as usize] } else { [0, 0, 0, 0] };
+                        let a = px[3] as u32;
+                        for c in 0..3 {
+                            out.push((px[c] as u32 + bg[c] as u32 * (255 - a) / 255).min(255) as u8);
+                        }
+                    }
+                    out.resize(start + row_len as usize, 0);
+                }
+                std::fs::write(format!("{dir}/{name}-{scale}.bmp"), out).unwrap();
+            }
+        }
     }
 }
