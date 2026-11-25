@@ -11,6 +11,7 @@ mod http;
 mod icons;
 mod model;
 mod providers;
+mod taskbar;
 mod render;
 
 use http::wide;
@@ -30,7 +31,9 @@ use windows_sys::Win32::System::Time::*;
 use windows_sys::Win32::UI::Controls::*;
 use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
-use windows_sys::Win32::UI::Shell::ShellExecuteW;
+use windows_sys::Win32::UI::Shell::{
+    ShellExecuteW, Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
+};
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 use windows_sys::w;
 
@@ -42,6 +45,10 @@ const CMD_AUTOSTART: usize = 20;
 const CMD_OPEN_CLAUDE: usize = 21;
 const CMD_EXIT: usize = 30;
 const CMD_COPILOT_BASE: usize = 100;
+const CMD_MONITOR_BASE: usize = 200;
+const CMD_TOGGLE_WIDGET: usize = 22;
+const WM_APP_TRAY: u32 = WM_APP + 2;
+const TRAY_ID: u32 = 1;
 
 const REG_APP: &str = "Software\\AiQuotaBar";
 const REG_RUN: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
@@ -129,6 +136,10 @@ struct Ui {
     rendered: Option<(render::Model, i32, u32)>,
     pos: (i32, i32, i32, i32),
     workers: Vec<Sender<()>>,
+    /// 要顯示在哪個螢幕（裝置名稱）；None 為主螢幕。
+    monitor: Option<String>,
+    /// 使用者把小工具整個隱藏了（從系統匣圖示再叫出來）。
+    widget_hidden: bool,
 }
 
 thread_local! {
@@ -387,13 +398,20 @@ unsafe fn create_tooltip(widget: HWND) -> HWND {
     tip
 }
 
-/// 建立（或在工作列重建後重建）嵌入視窗，放到系統匣左邊，內容有變才重畫。
+/// 建立（或在工作列重建、換螢幕後重建）嵌入視窗，放到系統匣（或副螢幕時鐘）左邊，內容有變才重畫。
 fn ensure_widget() {
     unsafe {
-        let taskbar = FindWindowW(w!("Shell_TrayWnd"), null());
-        if taskbar.is_null() {
+        if with(|u| u.widget_hidden) {
+            let widget = with(|u| u.widget);
+            if !widget.is_null() && IsWindow(widget) != 0 && IsWindowVisible(widget) != 0 {
+                ShowWindow(widget, SW_HIDE);
+            }
             return;
         }
+        let Some(screen) = taskbar::find(with(|u| u.monitor.clone()).as_deref()) else {
+            return;
+        };
+        let taskbar = screen.taskbar;
         let (mut widget, old_taskbar) = with(|u| (u.widget, u.taskbar));
         if widget.is_null() || IsWindow(widget) == 0 || taskbar != old_taskbar {
             if !widget.is_null() && IsWindow(widget) != 0 {
@@ -451,7 +469,10 @@ fn ensure_widget() {
         let pos = if vertical {
             (0, (tr.top - tb.top - wh - gap).max(0), w, wh)
         } else {
-            ((tr.left - tb.left - w - gap).max(0), 0, w, wh)
+            // 副螢幕沒有系統匣，保留時鐘的寬度；主螢幕找不到系統匣時也保留一段。
+            let reserve = ((if screen.primary { 200 } else { taskbar::SECONDARY_CLOCK_RESERVE }) as f32 * scale) as i32;
+            let limit = taskbar::right_limit(tb.left, tb.right, &taskbar::obstacles(taskbar), reserve);
+            ((limit - tb.left - w - gap).max(0), 0, w, wh)
         };
         let moved = with(|u| std::mem::replace(&mut u.pos, pos) != pos);
         // 工作列自己的 XAML 內容也是子視窗，保持在最上層才看得到。
@@ -472,6 +493,74 @@ fn refresh_all() {
             let _ = tx.send(());
         }
     });
+}
+
+/// 隱藏／顯示整個工作列小工具（設定會記住）。
+fn toggle_widget() {
+    let hidden = with(|u| {
+        u.widget_hidden = !u.widget_hidden;
+        u.rendered = None;
+        u.widget_hidden
+    });
+    reg_set_dword(REG_APP, "WidgetHidden", hidden as u32);
+    ensure_widget();
+}
+
+/// 把 BGRA 像素做成 HICON。
+unsafe fn make_icon(size: i32, px: &[[u8; 4]]) -> HICON {
+    let dc = GetDC(null_mut());
+    let bmi = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: size,
+            biHeight: -size,
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB,
+            ..std::mem::zeroed()
+        },
+        ..std::mem::zeroed()
+    };
+    let mut bits = null_mut();
+    let color = CreateDIBSection(dc, &bmi, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
+    ReleaseDC(null_mut(), dc);
+    if color.is_null() {
+        return null_mut();
+    }
+    std::ptr::copy_nonoverlapping(px.as_ptr(), bits as *mut [u8; 4], px.len());
+    let mask_bits = vec![0u8; ((size + 15) / 16 * 2 * size) as usize];
+    let mask = CreateBitmap(size, size, 1, 1, mask_bits.as_ptr() as *const _);
+    let info = ICONINFO { fIcon: 1, xHotspot: 0, yHotspot: 0, hbmMask: mask, hbmColor: color };
+    let icon = CreateIconIndirect(&info);
+    DeleteObject(mask);
+    DeleteObject(color);
+    icon
+}
+
+fn tray_data(ctl: HWND) -> NOTIFYICONDATAW {
+    let mut nid: NOTIFYICONDATAW = unsafe { std::mem::zeroed() };
+    nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+    nid.hWnd = ctl;
+    nid.uID = TRAY_ID;
+    nid
+}
+
+/// 系統匣圖示：左鍵顯示／隱藏工作列小工具，右鍵開選單。
+unsafe fn tray_add(ctl: HWND) {
+    let size = 32;
+    let mut nid = tray_data(ctl);
+    nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+    nid.uCallbackMessage = WM_APP_TRAY;
+    nid.hIcon = make_icon(size, &render::tray_icon(size));
+    let tip: Vec<u16> = "AI Quota Bar（左鍵：顯示／隱藏，右鍵：選單）".encode_utf16().collect();
+    let n = tip.len().min(nid.szTip.len() - 1);
+    nid.szTip[..n].copy_from_slice(&tip[..n]);
+    Shell_NotifyIconW(NIM_ADD, &nid);
+}
+
+unsafe fn tray_remove(ctl: HWND) {
+    let nid = tray_data(ctl);
+    Shell_NotifyIconW(NIM_DELETE, &nid);
 }
 
 unsafe fn show_menu() {
@@ -506,6 +595,20 @@ unsafe fn show_menu() {
         }
         AppendMenuW(menu, MF_POPUP, sub as usize, wide("Copilot 帳號").as_ptr());
     }
+    // 顯示在哪個螢幕的工作列。
+    let screens = taskbar::screens();
+    if screens.len() > 1 {
+        let sub = CreatePopupMenu();
+        let current = taskbar::find(with(|u| u.monitor.clone()).as_deref()).map(|s| s.device);
+        for (i, sc) in screens.iter().enumerate() {
+            let checked = current.as_deref() == Some(sc.device.as_str());
+            let flags = MF_STRING | if checked { MF_CHECKED } else { MF_UNCHECKED };
+            AppendMenuW(sub, flags, CMD_MONITOR_BASE + i, wide(&taskbar::label(i, sc)).as_ptr());
+        }
+        AppendMenuW(menu, MF_POPUP, sub as usize, wide("顯示在").as_ptr());
+    }
+    let hidden_now = with(|u| u.widget_hidden);
+    add(CMD_TOGGLE_WIDGET, if hidden_now { "顯示工作列小工具" } else { "隱藏工作列小工具" }, false);
     AppendMenuW(menu, MF_SEPARATOR, 0, null());
     add(CMD_OPEN_CLAUDE, "開啟 Claude 用量頁面", false);
     add(CMD_AUTOSTART, "開機時自動啟動", reg_has_value(REG_RUN, RUN_NAME));
@@ -516,6 +619,8 @@ unsafe fn show_menu() {
     SetForegroundWindow(ctl);
     let _ = widget;
     let cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, ctl, null()) as usize;
+    // 從系統匣叫出的選單：讓它在點別處時能正常關閉（Windows 文件建議的做法）。
+    PostMessageW(ctl, WM_NULL, 0, 0);
     DestroyMenu(menu);
     match cmd {
         CMD_REFRESH => refresh_all(),
@@ -525,6 +630,16 @@ unsafe fn show_menu() {
         }
         CMD_EXIT => {
             DestroyWindow(ctl);
+        }
+        CMD_TOGGLE_WIDGET => toggle_widget(),
+        c if c >= CMD_MONITOR_BASE && c - CMD_MONITOR_BASE < screens.len() => {
+            let device = screens[c - CMD_MONITOR_BASE].device.clone();
+            reg_set_string(REG_APP, "Monitor", &device);
+            with(|u| {
+                u.monitor = Some(device);
+                u.rendered = None;
+            });
+            ensure_widget();
         }
         c if c >= CMD_COPILOT_BASE && c - CMD_COPILOT_BASE < accounts.len() => {
             let login = accounts[c - CMD_COPILOT_BASE].0.clone();
@@ -567,6 +682,14 @@ unsafe extern "system" fn ctl_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
             ensure_widget();
             0
         }
+        WM_APP_TRAY => {
+            match lp as u32 {
+                WM_LBUTTONUP => toggle_widget(),
+                WM_RBUTTONUP | WM_CONTEXTMENU => show_menu(),
+                _ => {}
+            }
+            0
+        }
         WM_ENDSESSION => {
             // 登出／關機：Windows 收到回覆後就會結束程式，先等換 token 做完。
             claude_auth::wait_idle(std::time::Duration::from_secs(15));
@@ -579,12 +702,14 @@ unsafe extern "system" fn ctl_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
             if !widget.is_null() && IsWindow(widget) != 0 {
                 DestroyWindow(widget);
             }
+            tray_remove(h);
             PostQuitMessage(0);
             0
         }
         _ if Some(m) == created => {
-            // explorer.exe 重啟：子視窗跟著舊工作列消失，重建。
+            // explorer.exe 重啟：子視窗跟著舊工作列消失，系統匣圖示也要重新加。
             with(|u| u.widget = null_mut());
+            tray_add(h);
             ensure_widget();
             0
         }
@@ -735,11 +860,14 @@ fn main() {
                 rendered: None,
                 pos: (0, 0, 0, 0),
                 workers: Vec::new(),
+                monitor: reg_get_string(REG_APP, "Monitor"),
+                widget_hidden: reg_get_dword(HKEY_CURRENT_USER, REG_APP, "WidgetHidden") == Some(1),
             })
         });
         CTL.store(ctl as isize, Ordering::Relaxed);
         let workers = ALL.iter().map(|p| spawn_worker(*p)).collect();
         with(|u| u.workers = workers);
+        tray_add(ctl);
         ensure_widget();
         // 系統匣寬度會變（圖示增減），定時重新對齊。
         SetTimer(ctl, TIMER_PLACE, 2000, None);

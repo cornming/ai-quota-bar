@@ -482,3 +482,24 @@ pub fn render(m: &Model, h: i32, scale: f32) -> Frame {
         cv.into_frame()
     }
 }
+
+/// 系統匣圖示：深色圓角方塊裡三根由低到高的霓虹 LED 柱。回傳未預乘的 BGRA。
+pub fn tray_icon(size: i32) -> Vec<[u8; 4]> {
+    let f = size as f32 / 32.0;
+    let mut cv = Canvas::new(size, size);
+    cv.rrect(f, f, 30.0 * f, 30.0 * f, 7.0 * f, PANEL, 1.0, Some(PANEL_TOP));
+    cv.rrect_stroke(1.5 * f, 1.5 * f, 29.0 * f, 29.0 * f, 6.5 * f, 1.5 * f, NEON, 0.9);
+    for (i, (hgt, c)) in [(8.0, NEON), (13.0, NEON), (18.0, WARN)].iter().enumerate() {
+        let x = (8.0 + i as f32 * 6.0) * f;
+        let y = (25.0 - hgt) * f;
+        cv.glow(x, y, 4.0 * f, hgt * f, 3.0 * f, *c, 0.35);
+        cv.rrect(x, y, 4.0 * f, hgt * f, 1.0 * f, *c, 1.0, None);
+    }
+    cv.px
+        .iter()
+        .map(|p| {
+            let q = |v: f32| (v * 255.0).round().clamp(0.0, 255.0) as u8;
+            [q(p[2]), q(p[1]), q(p[0]), q(p[3])]
+        })
+        .collect()
+}
