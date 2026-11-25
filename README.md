@@ -66,3 +66,7 @@ cargo build --release
 ```
 
 `fixtures/` 是實際 API 回應（已去除帳號資訊），給解析測試用。
+
+## 授權
+
+[MIT](LICENSE)。Claude、Codex／OpenAI、GitHub Copilot、Antigravity 是各自公司的商標，本專案與它們無關，也未獲背書；圖示是執行時從使用者已安裝的 App 讀取，不隨程式散布。
