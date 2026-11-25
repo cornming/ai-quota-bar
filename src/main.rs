@@ -8,6 +8,7 @@
 
 mod claude_auth;
 mod http;
+mod icons;
 mod model;
 mod providers;
 mod render;
@@ -40,6 +41,7 @@ const CMD_TOGGLE_BASE: usize = 10;
 const CMD_AUTOSTART: usize = 20;
 const CMD_OPEN_CLAUDE: usize = 21;
 const CMD_EXIT: usize = 30;
+const CMD_COPILOT_BASE: usize = 100;
 
 const REG_APP: &str = "Software\\AiQuotaBar";
 const REG_RUN: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
@@ -151,6 +153,26 @@ fn reg_get_dword(root: HKEY, key: &str, name: &str) -> Option<u32> {
 fn reg_set_dword(key: &str, name: &str, v: u32) {
     unsafe {
         RegSetKeyValueW(HKEY_CURRENT_USER, wide(key).as_ptr(), wide(name).as_ptr(), REG_DWORD, &v as *const u32 as *const _, 4);
+    }
+}
+
+fn reg_get_string(key: &str, name: &str) -> Option<String> {
+    let mut buf = vec![0u16; 512];
+    let mut len = (buf.len() * 2) as u32;
+    let r = unsafe {
+        RegGetValueW(HKEY_CURRENT_USER, wide(key).as_ptr(), wide(name).as_ptr(), RRF_RT_REG_SZ, null_mut(), buf.as_mut_ptr() as *mut _, &mut len)
+    };
+    if r != 0 {
+        return None;
+    }
+    let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    Some(String::from_utf16_lossy(&buf[..end])).filter(|s| !s.is_empty())
+}
+
+fn reg_set_string(key: &str, name: &str, v: &str) {
+    let w = wide(v);
+    unsafe {
+        RegSetKeyValueW(HKEY_CURRENT_USER, wide(key).as_ptr(), wide(name).as_ptr(), REG_SZ, w.as_ptr() as *const _, (w.len() * 2) as u32);
     }
 }
 
@@ -272,6 +294,7 @@ fn build_model(dark: bool, hover: bool) -> render::Model {
         let now = now_secs();
         match (&s.quota, &s.error) {
             (Some(q), _) => blocks.push(render::Block {
+                provider: Some(p),
                 name: p.short().into(),
                 rows: q
                     .windows
@@ -288,16 +311,18 @@ fn build_model(dark: bool, hover: bool) -> render::Model {
             // 沒設定或已停用的那家不佔位置；其他錯誤顯示「!」。
             (None, Some(FetchError::NotSetUp(_) | FetchError::Disabled(_))) | (None, None) => {}
             (None, Some(_)) => blocks.push(render::Block {
+                provider: Some(p),
                 name: p.short().into(),
-                rows: vec![render::Row { label: "!".into(), used: None }],
+                rows: vec![render::Row { label: "ERR".into(), used: None }],
                 stale: true,
             }),
         }
     }
     if blocks.is_empty() {
         blocks.push(render::Block {
-            name: "AI".into(),
-            rows: vec![render::Row { label: "…".into(), used: None }],
+            provider: None,
+            name: "AI QUOTA".into(),
+            rows: vec![render::Row { label: "...".into(), used: None }],
             stale: true,
         });
     }
@@ -466,6 +491,21 @@ unsafe fn show_menu() {
         }
         add(CMD_TOGGLE_BASE + p.index(), &label, !HIDDEN[p.index()].load(Ordering::Relaxed));
     }
+    // Copilot 帳號：列出 gh 登入的 github.com 帳號，單選。
+    let accounts = providers::gh_accounts();
+    if accounts.len() > 1 {
+        let sub = CreatePopupMenu();
+        let chosen = providers::copilot_login();
+        for (i, (login, active)) in accounts.iter().enumerate() {
+            let checked = match &chosen {
+                Some(c) => c == login,
+                None => *active,
+            };
+            let flags = MF_STRING | if checked { MF_CHECKED } else { MF_UNCHECKED };
+            AppendMenuW(sub, flags, CMD_COPILOT_BASE + i, wide(login).as_ptr());
+        }
+        AppendMenuW(menu, MF_POPUP, sub as usize, wide("Copilot 帳號").as_ptr());
+    }
     AppendMenuW(menu, MF_SEPARATOR, 0, null());
     add(CMD_OPEN_CLAUDE, "開啟 Claude 用量頁面", false);
     add(CMD_AUTOSTART, "開機時自動啟動", reg_has_value(REG_RUN, RUN_NAME));
@@ -485,6 +525,17 @@ unsafe fn show_menu() {
         }
         CMD_EXIT => {
             DestroyWindow(ctl);
+        }
+        c if c >= CMD_COPILOT_BASE && c - CMD_COPILOT_BASE < accounts.len() => {
+            let login = accounts[c - CMD_COPILOT_BASE].0.clone();
+            reg_set_string(REG_APP, "CopilotAccount", &login);
+            providers::set_copilot_login(Some(login));
+            // 舊帳號的數字不能留著，等新帳號查完再顯示。
+            SLOTS.lock().unwrap()[Provider::Copilot.index()] = None;
+            with(|u| {
+                let _ = u.workers[Provider::Copilot.index()].send(());
+            });
+            ensure_widget();
         }
         c if (CMD_TOGGLE_BASE..CMD_TOGGLE_BASE + 4).contains(&c) => {
             let i = c - CMD_TOGGLE_BASE;
@@ -622,6 +673,7 @@ fn debug_force_claude_refresh(report: &str) {
 
 /// `--dump <檔案>`：查一次全部，把提示文字寫到檔案後結束（驗證用）。
 fn dump(path: &str) {
+    providers::set_copilot_login(reg_get_string(REG_APP, "CopilotAccount"));
     for p in ALL {
         store(p, p.fetch());
     }
@@ -669,6 +721,7 @@ fn main() {
             0, 0, 0, 0, null_mut(), null_mut(), hinst, null(),
         );
         load_hidden();
+        providers::set_copilot_login(reg_get_string(REG_APP, "CopilotAccount"));
         UI.with(|u| {
             *u.borrow_mut() = Some(Ui {
                 ctl,

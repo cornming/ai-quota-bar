@@ -1,5 +1,8 @@
 //! 把工作列上的內容畫成預乘 alpha 的 BGRA 像素，交給 UpdateLayeredWindow。
 //!
+//! 風格：深色 HUD 面板（不管工作列深淺色都一樣），霓虹青色邊框與四角括號、
+//! 淡掃描線、LED 分段進度條（亮起的格子有光暈）、等寬數字。
+//!
 //! GDI 畫字不帶 alpha，所以先在黑底畫白字當遮罩，用亮度當覆蓋率再上色。
 
 use crate::http::wide;
@@ -15,53 +18,45 @@ const fn hex(v: u32) -> Rgb {
     Rgb(((v >> 16) & 255) as f32 / 255.0, ((v >> 8) & 255) as f32 / 255.0, (v & 255) as f32 / 255.0)
 }
 
-pub struct Palette {
-    pub name: Rgb,
-    pub text: Rgb,
-    pub track: (Rgb, f32),
-    pub bar: Rgb,
-    pub warn: Rgb,
-    pub crit: Rgb,
-    pub hover: (Rgb, f32),
-    pub stale: f32,
-}
+// ---------- 配色 ----------
 
-pub fn palette(dark: bool) -> Palette {
-    if dark {
-        Palette {
-            name: hex(0xC8C8C8),
-            text: hex(0xFFFFFF),
-            track: (hex(0xFFFFFF), 0.18),
-            bar: hex(0x60CDFF),
-            warn: hex(0xF5A35C),
-            crit: hex(0xFF7B72),
-            hover: (hex(0xFFFFFF), 0.08),
-            stale: 0.45,
-        }
-    } else {
-        Palette {
-            name: hex(0x5A5A5A),
-            text: hex(0x1B1B1B),
-            track: (hex(0x000000), 0.14),
-            bar: hex(0x005FB8),
-            warn: hex(0xB4500F),
-            crit: hex(0xC42B1C),
-            hover: (hex(0xFFFFFF), 0.55),
-            stale: 0.45,
-        }
+const PANEL: Rgb = hex(0x070B12);
+const PANEL_TOP: Rgb = hex(0x0E1722);
+const NEON: Rgb = hex(0x00E5FF);
+const WARN: Rgb = hex(0xFFB020);
+const CRIT: Rgb = hex(0xFF2E63);
+const NAME: Rgb = hex(0xBDF6FF);
+const LABEL: Rgb = hex(0x4F7A8C);
+const VALUE: Rgb = hex(0xE8FBFF);
+const SEG_OFF: Rgb = hex(0x13303C);
+const IDLE: Rgb = hex(0x55636B);
+/// 資料過期時內容的透明度。
+const STALE: f32 = 0.4;
+/// LED 進度條的格數。
+const SEGMENTS: i32 = 8;
+
+fn level_color(used: f64) -> Rgb {
+    match level(used) {
+        Level::Normal => NEON,
+        Level::Warn => WARN,
+        Level::Crit => CRIT,
     }
 }
 
-/// 一列：「5h 16%」加一條細進度條。
+// ---------- 資料 ----------
+
+/// 一列：「5H ▮▮▮▯▯▯▯▯▯▯ 28%」。
 #[derive(Clone, PartialEq, Debug)]
 pub struct Row {
     pub label: String,
     pub used: Option<f64>,
 }
 
-/// 一家：名稱在左，最多兩列數值在右。
+/// 一家：狀態燈與名稱在左，最多兩列數值在右。
 #[derive(Clone, PartialEq, Debug)]
 pub struct Block {
+    /// 有對應的 App 圖示就畫圖示，沒有才畫名稱文字。
+    pub provider: Option<crate::providers::Provider>,
     pub name: String,
     pub rows: Vec<Row>,
     /// 資料過期（登入過期或暫時錯誤）時淡化顯示。
@@ -71,6 +66,7 @@ pub struct Block {
 #[derive(Clone, PartialEq, Debug)]
 pub struct Model {
     pub blocks: Vec<Block>,
+    /// 工作列是深色。面板本身固定深色，淺色工作列時加一圈外框陰影讓面板浮起來。
     pub dark: bool,
     pub hover: bool,
 }
@@ -80,6 +76,8 @@ pub struct Frame {
     pub h: i32,
     pub px: Vec<[u8; 4]>,
 }
+
+// ---------- 畫布 ----------
 
 struct Canvas {
     w: i32,
@@ -92,10 +90,12 @@ impl Canvas {
     fn new(w: i32, h: i32) -> Self {
         Canvas { w, h, px: vec![[0.0; 4]; (w * h) as usize] }
     }
+
     fn blend(&mut self, x: i32, y: i32, c: Rgb, a: f32) {
         if x < 0 || y < 0 || x >= self.w || y >= self.h || a <= 0.0 {
             return;
         }
+        let a = a.min(1.0);
         let p = &mut self.px[(y * self.w + x) as usize];
         let out_a = a + p[3] * (1.0 - a);
         if out_a <= 0.0 {
@@ -104,6 +104,22 @@ impl Canvas {
         let mix = |src: f32, dst: f32| (src * a + dst * p[3] * (1.0 - a)) / out_a;
         *p = [mix(c.0, p[0]), mix(c.1, p[1]), mix(c.2, p[2]), out_a];
     }
+
+    /// 只加亮不蓋掉（光暈用）。
+    fn add(&mut self, x: i32, y: i32, c: Rgb, a: f32) {
+        if x < 0 || y < 0 || x >= self.w || y >= self.h || a <= 0.0 {
+            return;
+        }
+        let p = &mut self.px[(y * self.w + x) as usize];
+        let base_a = p[3];
+        let out_a = (base_a + a * (1.0 - base_a)).min(1.0);
+        let k = a / out_a.max(1e-6);
+        p[0] = (p[0] * base_a / out_a.max(1e-6) + c.0 * k).min(1.0);
+        p[1] = (p[1] * base_a / out_a.max(1e-6) + c.1 * k).min(1.0);
+        p[2] = (p[2] * base_a / out_a.max(1e-6) + c.2 * k).min(1.0);
+        p[3] = out_a;
+    }
+
     fn fill(&mut self, x: i32, y: i32, w: i32, h: i32, c: Rgb, a: f32) {
         for yy in y..y + h {
             for xx in x..x + w {
@@ -111,6 +127,59 @@ impl Canvas {
             }
         }
     }
+
+    /// 圓角矩形；`grad` 不為 None 時由上往下從 grad 漸變到 c。
+    fn rrect(&mut self, x: f32, y: f32, w: f32, h: f32, r: f32, c: Rgb, a: f32, grad: Option<Rgb>) {
+        for py in (y.floor() as i32)..((y + h).ceil() as i32) {
+            for px in (x.floor() as i32)..((x + w).ceil() as i32) {
+                let cov = rrect_coverage(px as f32 + 0.5, py as f32 + 0.5, x, y, w, h, r);
+                if cov > 0.0 {
+                    let col = match grad {
+                        Some(top) => {
+                            let t = ((py as f32 + 0.5 - y) / h).clamp(0.0, 1.0);
+                            Rgb(top.0 + (c.0 - top.0) * t, top.1 + (c.1 - top.1) * t, top.2 + (c.2 - top.2) * t)
+                        }
+                        None => c,
+                    };
+                    self.blend(px, py, col, a * cov);
+                }
+            }
+        }
+    }
+
+    /// 圓角矩形外框（寬 `t`）。
+    fn rrect_stroke(&mut self, x: f32, y: f32, w: f32, h: f32, r: f32, t: f32, c: Rgb, a: f32) {
+        for py in (y.floor() as i32 - 1)..((y + h).ceil() as i32 + 1) {
+            for px in (x.floor() as i32 - 1)..((x + w).ceil() as i32 + 1) {
+                let d = rrect_sdf(px as f32 + 0.5, py as f32 + 0.5, x, y, w, h, r);
+                let cov = (t / 2.0 + 0.5 - (d + t / 2.0).abs()).clamp(0.0, 1.0);
+                self.blend(px, py, c, a * cov);
+            }
+        }
+    }
+
+    /// 矩形周圍的柔和光暈。
+    fn glow(&mut self, x: f32, y: f32, w: f32, h: f32, radius: f32, c: Rgb, a: f32) {
+        for py in ((y - radius).floor() as i32)..((y + h + radius).ceil() as i32) {
+            for px in ((x - radius).floor() as i32)..((x + w + radius).ceil() as i32) {
+                let d = rrect_sdf(px as f32 + 0.5, py as f32 + 0.5, x, y, w, h, 0.0).max(0.0);
+                if d < radius {
+                    let f = 1.0 - d / radius;
+                    self.add(px, py, c, a * f * f);
+                }
+            }
+        }
+    }
+
+    fn circle(&mut self, cx: f32, cy: f32, r: f32, c: Rgb, a: f32) {
+        for py in ((cy - r - 1.0).floor() as i32)..((cy + r + 1.0).ceil() as i32) {
+            for px in ((cx - r - 1.0).floor() as i32)..((cx + r + 1.0).ceil() as i32) {
+                let d = ((px as f32 + 0.5 - cx).powi(2) + (py as f32 + 0.5 - cy).powi(2)).sqrt();
+                self.blend(px, py, c, a * (r + 0.5 - d).clamp(0.0, 1.0));
+            }
+        }
+    }
+
     fn into_frame(self) -> Frame {
         let px = self
             .px
@@ -126,6 +195,22 @@ impl Canvas {
     }
 }
 
+/// 點到圓角矩形邊界的帶號距離（內部為負）。
+fn rrect_sdf(px: f32, py: f32, x: f32, y: f32, w: f32, h: f32, r: f32) -> f32 {
+    let (hw, hh) = (w / 2.0, h / 2.0);
+    let (cx, cy) = (x + hw, y + hh);
+    let qx = (px - cx).abs() - (hw - r);
+    let qy = (py - cy).abs() - (hh - r);
+    let outside = (qx.max(0.0).powi(2) + qy.max(0.0).powi(2)).sqrt();
+    outside + qx.max(qy).min(0.0) - r
+}
+
+fn rrect_coverage(px: f32, py: f32, x: f32, y: f32, w: f32, h: f32, r: f32) -> f32 {
+    (0.5 - rrect_sdf(px, py, x, y, w, h, r)).clamp(0.0, 1.0)
+}
+
+// ---------- 文字 ----------
+
 /// 用 GDI 量字與畫字，回傳覆蓋率遮罩。
 struct TextMask {
     dc: HDC,
@@ -133,29 +218,39 @@ struct TextMask {
 }
 
 impl TextMask {
-    unsafe fn new(px: i32, bold: bool) -> Self {
+    unsafe fn new(px: i32, weight: i32, face: &str) -> Self {
         let dc = CreateCompatibleDC(null_mut());
-        let face = wide("Microsoft JhengHei UI");
+        let face = wide(face);
         let font = CreateFontW(
-            -px, 0, 0, 0, if bold { 600 } else { 400 }, 0, 0, 0,
-            DEFAULT_CHARSET as u32, OUT_DEFAULT_PRECIS as u32, CLIP_DEFAULT_PRECIS as u32,
+            -px, 0, 0, 0, weight, 0, 0, 0,
+            DEFAULT_CHARSET as u32, OUT_TT_PRECIS as u32, CLIP_DEFAULT_PRECIS as u32,
             ANTIALIASED_QUALITY as u32, (DEFAULT_PITCH | FF_DONTCARE) as u32, face.as_ptr(),
         );
         SelectObject(dc, font);
         TextMask { dc, font }
     }
+
     unsafe fn measure(&self, s: &str) -> (i32, i32) {
         let w = wide(s);
         let mut sz = SIZE { cx: 0, cy: 0 };
         GetTextExtentPoint32W(self.dc, w.as_ptr(), (w.len() - 1) as i32, &mut sz);
         (sz.cx, sz.cy)
     }
-    /// 在畫布 (x, y) 畫字，y 是字框上緣。
-    unsafe fn draw(&self, cv: &mut Canvas, s: &str, x: i32, y: i32, c: Rgb, alpha: f32) {
+
+    /// 字的上緣到基線的距離，用來讓不同字型的字對齊同一條基線。
+    unsafe fn ascent(&self) -> i32 {
+        let mut tm: TEXTMETRICW = std::mem::zeroed();
+        GetTextMetricsW(self.dc, &mut tm);
+        tm.tmAscent
+    }
+
+    /// 在畫布上畫字，`baseline` 是基線的 y。
+    unsafe fn draw(&self, cv: &mut Canvas, s: &str, x: i32, baseline: i32, c: Rgb, alpha: f32) {
         let (tw, th) = self.measure(s);
         if tw <= 0 || th <= 0 {
             return;
         }
+        let y = baseline - self.ascent();
         let bmi = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER {
                 biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
@@ -202,91 +297,187 @@ impl Drop for TextMask {
     }
 }
 
-fn level_color(p: &Palette, used: f64) -> Rgb {
-    match level(used) {
-        Level::Normal => p.bar,
-        Level::Warn => p.warn,
-        Level::Crit => p.crit,
+fn value_text(used: Option<f64>) -> String {
+    match used {
+        Some(v) => format!("{:>3}%", v.round().clamp(0.0, 999.0) as i64),
+        None => "  –%".into(),
     }
 }
 
-fn value_text(used: Option<f64>) -> String {
-    match used {
-        Some(v) => format!("{}%", v.round() as i64),
-        None => "–".into(),
+/// 這家目前最嚴重的程度，決定狀態燈顏色。
+fn block_color(b: &Block) -> Rgb {
+    if b.stale {
+        return IDLE;
     }
+    b.rows.iter().filter_map(|r| r.used).fold(None::<f64>, |m, u| Some(m.map_or(u, |m| m.max(u)))).map_or(IDLE, level_color)
 }
+
+// ---------- 版面 ----------
 
 /// 畫出整條。`h` 是工作列高度（實際像素），`scale` 是 DPI 倍率。
 pub fn render(m: &Model, h: i32, scale: f32) -> Frame {
     let s = |v: f32| (v * scale).round() as i32;
-    let pal = palette(m.dark);
+    let f = |v: f32| v * scale;
     unsafe {
-        let name_font = TextMask::new(s(12.0), true);
-        let row_font = TextMask::new(s(10.5), false);
-        let pad = s(6.0);
-        let gap_name = s(5.0);
-        let gap_blocks = s(12.0);
-        let bar_h = s(2.0).max(1);
-        let label_gap = s(3.0);
+        let name_font = TextMask::new(s(9.5), 600, "Bahnschrift");
+        let label_font = TextMask::new(s(8.5), 400, "Cascadia Mono");
+        let value_font = TextMask::new(s(9.5), 600, "Cascadia Mono");
 
-        // 先排版：每家的名稱寬度、標籤寬度、數值寬度。
-        let pct_w = row_font.measure("100%").0;
+        let pad_x = s(8.0);
+        let dot_gap = s(4.0);
+        let name_gap = s(6.0);
+        let sep_gap = s(5.0);
+        let seg_w = s(2.0).max(2);
+        let seg_gap = s(1.0).max(1);
+        let seg_h = s(6.0).max(3);
+        let bar_w = SEGMENTS * seg_w + (SEGMENTS - 1) * seg_gap;
+        let col_gap = s(3.0);
+        let dot_r = f(2.5);
+
+        let value_w = value_font.measure("100%").0;
+        let icon_size = s(18.0).min(h - s(12.0)).max(12);
+        let dot_w = (dot_r * 2.0).ceil() as i32;
         struct Lay {
-            name_w: i32,
+            icon: Option<std::rc::Rc<crate::icons::Icon>>,
+            /// 圖示或「狀態燈＋名稱」的寬度。
+            head_w: i32,
             label_w: i32,
         }
         let lays: Vec<Lay> = m
             .blocks
             .iter()
-            .map(|b| Lay {
-                name_w: name_font.measure(&b.name).0,
-                label_w: b.rows.iter().map(|r| row_font.measure(&r.label).0).max().unwrap_or(0),
+            .map(|b| {
+                let icon = b.provider.and_then(|p| crate::icons::get(p, icon_size));
+                Lay {
+                    head_w: if icon.is_some() { icon_size } else { dot_w + dot_gap + name_font.measure(&b.name).0 },
+                    icon,
+                    label_w: b.rows.iter().map(|r| label_font.measure(&r.label).0).max().unwrap_or(0),
+                }
             })
             .collect();
-        let block_w = |l: &Lay| l.name_w + gap_name + l.label_w + label_gap + pct_w;
-        let total: i32 = if lays.is_empty() {
-            s(40.0)
-        } else {
-            pad * 2 + lays.iter().map(block_w).sum::<i32>() + gap_blocks * (lays.len() as i32 - 1)
-        };
+        let block_w = |l: &Lay| l.head_w + name_gap + l.label_w + col_gap + bar_w + col_gap + value_w;
+        let content: i32 =
+            lays.iter().map(block_w).sum::<i32>() + (sep_gap * 2 + 1) * (lays.len() as i32 - 1).max(0);
+        let total = pad_x * 2 + content;
         let mut cv = Canvas::new(total.max(1), h.max(1));
-        if m.hover {
-            cv.fill(0, s(3.0), cv.w, h - s(6.0), pal.hover.0, pal.hover.1);
+
+        // 面板：上下各留一點，讓工作列看得出這是一塊浮起來的 HUD。
+        let my = f(3.0);
+        let (px0, py0, pw, ph) = (f(1.0), my, total as f32 - f(2.0), h as f32 - my * 2.0);
+        let radius = f(5.0);
+        if !m.dark {
+            // 淺色工作列：外圈淡陰影。
+            cv.rrect_stroke(px0, py0, pw, ph, radius, f(2.0), hex(0x000000), 0.10);
+        }
+        cv.rrect(px0, py0, pw, ph, radius, PANEL, 0.94, Some(PANEL_TOP));
+        // 掃描線。
+        let step = s(3.0).max(2);
+        let mut yy = py0 as i32 + 1;
+        while (yy as f32) < py0 + ph - 1.0 {
+            for xx in (px0 as i32 + 2)..((px0 + pw) as i32 - 2) {
+                cv.blend(xx, yy, NEON, 0.035);
+            }
+            yy += step;
+        }
+        // 邊框與四角括號。
+        cv.rrect_stroke(px0 + 0.5, py0 + 0.5, pw - 1.0, ph - 1.0, radius, 1.0, NEON, if m.hover { 0.55 } else { 0.22 });
+        let arm = s(7.0);
+        let t = s(1.5).max(1);
+        let (l, tp, r, b) = (px0 as i32, py0 as i32, (px0 + pw) as i32, (py0 + ph) as i32);
+        let corner_a = if m.hover { 1.0 } else { 0.85 };
+        for (cx, cy, dx, dy) in [(l, tp, 1, 1), (r, tp, -1, 1), (l, b, 1, -1), (r, b, -1, -1)] {
+            let hx = if dx > 0 { cx } else { cx - arm };
+            let vy = if dy > 0 { cy } else { cy - arm };
+            let hy = if dy > 0 { cy } else { cy - t };
+            let vx = if dx > 0 { cx } else { cx - t };
+            cv.fill(hx, hy, arm, t, NEON, corner_a);
+            cv.fill(vx, vy, t, arm, NEON, corner_a);
         }
 
-        let row_h = row_font.measure("0").1;
-        let name_h = name_font.measure("C").1;
-        let mut x = pad;
-        for (b, l) in m.blocks.iter().zip(&lays) {
-            let alpha = if b.stale { pal.stale } else { 1.0 };
-            name_font.draw(&mut cv, &b.name, x, (h - name_h) / 2, pal.name, alpha);
-            let cx = x + l.name_w + gap_name;
-            let n = b.rows.len().max(1) as i32;
-            // 每列：字 + 進度條；正黑體字框下方留白多，進度條往上疊進字框底部。整體垂直置中。
-            let line_h = row_h - s(2.0) + bar_h;
-            let row_gap = s(1.0);
-            let block_h = line_h * n + row_gap * (n - 1);
-            let mut y = (h - block_h) / 2;
-            for r in &b.rows {
-                let color = r.used.map_or(pal.text, |u| match level(u) {
-                    Level::Normal => pal.text,
-                    _ => level_color(&pal, u),
-                });
-                row_font.draw(&mut cv, &r.label, cx, y, pal.name, alpha);
-                let vt = value_text(r.used);
-                let vx = cx + l.label_w + label_gap + pct_w - row_font.measure(&vt).0;
-                row_font.draw(&mut cv, &vt, vx, y, color, alpha);
-                let by = y + row_h - s(2.0);
-                let bw = l.label_w + label_gap + pct_w;
-                cv.fill(cx, by, bw, bar_h, pal.track.0, pal.track.1 * alpha);
-                if let Some(u) = r.used {
-                    let fw = ((bw as f64) * (u.clamp(0.0, 100.0) / 100.0)).round() as i32;
-                    cv.fill(cx, by, fw, bar_h, level_color(&pal, u), alpha);
+        // 內容。
+        let mid = h / 2;
+        let value_asc = value_font.ascent();
+        let row_pitch = s(13.0);
+        let mut x = pad_x;
+        for (i, (b, lay)) in m.blocks.iter().zip(&lays).enumerate() {
+            if i > 0 {
+                // 區塊分隔線：上下淡出。
+                let sx = x + sep_gap;
+                let (top, bot) = (py0 as i32 + s(6.0), (py0 + ph) as i32 - s(6.0));
+                for yy in top..bot {
+                    let t = (yy - top) as f32 / (bot - top).max(1) as f32;
+                    let fade = 1.0 - (t * 2.0 - 1.0).abs();
+                    cv.blend(sx, yy, NEON, 0.35 * fade);
                 }
-                y += line_h + row_gap;
+                x += sep_gap * 2 + 1;
             }
-            x += block_w(l) + gap_blocks;
+            let a = if b.stale { STALE } else { 1.0 };
+            let dc = block_color(b);
+            if let Some(icon) = &lay.icon {
+                // App 圖示；過期時轉灰階並淡化。右下角疊一顆狀態燈。
+                let iy = mid - icon.size / 2;
+                for yy in 0..icon.size {
+                    for xx in 0..icon.size {
+                        let p = icon.px[(yy * icon.size + xx) as usize];
+                        let c = if b.stale {
+                            let l = 0.2126 * p[0] + 0.7152 * p[1] + 0.0722 * p[2];
+                            Rgb(l, l, l)
+                        } else {
+                            Rgb(p[0], p[1], p[2])
+                        };
+                        cv.blend(x + xx, iy + yy, c, p[3] * a);
+                    }
+                }
+                let lr = f(2.6);
+                let (lx, ly) = ((x + icon.size) as f32 - lr * 0.4, (iy + icon.size) as f32 - lr * 0.4);
+                cv.circle(lx, ly, lr + f(1.2), PANEL, 1.0);
+                if !b.stale {
+                    cv.glow(lx - lr, ly - lr, lr * 2.0, lr * 2.0, f(4.0), dc, 0.35);
+                }
+                cv.circle(lx, ly, lr, dc, 1.0);
+            } else {
+                let dcx = x as f32 + dot_r;
+                let dcy = mid as f32;
+                if !b.stale {
+                    cv.glow(dcx - dot_r, dcy - dot_r, dot_r * 2.0, dot_r * 2.0, f(4.0), dc, 0.35);
+                }
+                cv.circle(dcx, dcy, dot_r, dc, 1.0);
+                let name_base = mid + name_font.ascent() / 2 - s(1.0);
+                name_font.draw(&mut cv, &b.name, x + dot_w + dot_gap, name_base, NAME, a);
+            }
+
+            let cx = x + lay.head_w + name_gap;
+            let n = b.rows.len().max(1) as i32;
+            let first_center = mid - row_pitch * (n - 1) / 2;
+            for (ri, r) in b.rows.iter().enumerate() {
+                let rc = first_center + row_pitch * ri as i32;
+                let base = rc + value_asc / 2 - s(1.0);
+                label_font.draw(&mut cv, &r.label, cx, base, LABEL, a);
+                // LED 分段條。
+                let bx = cx + lay.label_w + col_gap;
+                let by = rc - seg_h / 2;
+                let lit = r.used.map_or(0, |u| ((u.clamp(0.0, 100.0) / 100.0) * SEGMENTS as f64).ceil() as i32);
+                let color = r.used.map_or(IDLE, level_color);
+                for k in 0..SEGMENTS {
+                    let sx = bx + k * (seg_w + seg_gap);
+                    if k < lit {
+                        if !b.stale {
+                            cv.glow(sx as f32, by as f32, seg_w as f32, seg_h as f32, f(3.0), color, 0.22);
+                        }
+                        cv.fill(sx, by, seg_w, seg_h, color, a);
+                    } else {
+                        cv.fill(sx, by, seg_w, seg_h, SEG_OFF, a);
+                    }
+                }
+                let vt = value_text(r.used);
+                let vcol = match r.used {
+                    Some(u) if level(u) != Level::Normal => level_color(u),
+                    _ => VALUE,
+                };
+                let vx = bx + bar_w + col_gap + value_w - value_font.measure(&vt).0;
+                value_font.draw(&mut cv, &vt, vx, base, vcol, a);
+            }
+            x += block_w(lay);
         }
         cv.into_frame()
     }

@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// 一個額度視窗，例如「5 小時」「每週」「每月聊天」。
 #[derive(Clone, Debug, PartialEq)]
 pub struct Window {
-    /// 工作列上的短標籤，例如 "5h"、"週"。
+    /// 工作列上的短標籤，例如 "5H"、"7D"。
     pub short: String,
     /// 提示文字裡的完整名稱，例如 "5 小時"。
     pub name: String,
@@ -124,12 +124,12 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 /// 依視窗長度（秒）給短標籤與名稱。
 pub fn window_label(seconds: i64) -> (String, String) {
     match seconds {
-        18000 => ("5h".into(), "5 小時".into()),
-        604800 => ("週".into(), "每週".into()),
-        86400 => ("日".into(), "每日".into()),
-        s if (2_419_200..=2_678_400).contains(&s) => ("月".into(), format!("{} 天", s / 86400)),
-        s if s % 86400 == 0 => (format!("{}d", s / 86400), format!("{} 天", s / 86400)),
-        s => (format!("{}h", (s + 1800) / 3600), format!("{} 小時", (s + 1800) / 3600)),
+        18000 => ("5H".into(), "5 小時".into()),
+        604800 => ("7D".into(), "每週".into()),
+        86400 => ("1D".into(), "每日".into()),
+        s if (2_419_200..=2_678_400).contains(&s) => (format!("{}D", s / 86400), format!("{} 天", s / 86400)),
+        s if s % 86400 == 0 => (format!("{}D", s / 86400), format!("{} 天", s / 86400)),
+        s => (format!("{}H", (s + 1800) / 3600), format!("{} 小時", (s + 1800) / 3600)),
     }
 }
 
@@ -173,10 +173,10 @@ mod tests {
 
     #[test]
     fn labels_windows() {
-        assert_eq!(window_label(18000).0, "5h");
-        assert_eq!(window_label(604800).0, "週");
-        assert_eq!(window_label(2592000), ("月".into(), "30 天".into()));
-        assert_eq!(window_label(3600).0, "1h");
+        assert_eq!(window_label(18000).0, "5H");
+        assert_eq!(window_label(604800).0, "7D");
+        assert_eq!(window_label(2592000), ("30D".into(), "30 天".into()));
+        assert_eq!(window_label(3600).0, "1H");
     }
 
     #[test]

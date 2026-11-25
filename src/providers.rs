@@ -34,8 +34,10 @@ impl Provider {
     /// 工作列上的名稱。
     pub fn short(self) -> &'static str {
         match self {
-            Provider::Antigravity => "AG",
-            p => p.name(),
+            Provider::Claude => "CLAUDE",
+            Provider::Codex => "CODEX",
+            Provider::Copilot => "COPILOT",
+            Provider::Antigravity => "AGY",
         }
     }
     /// 自動更新間隔。Antigravity 每次要啟動 CLI，所以拉長。
@@ -141,7 +143,7 @@ pub fn parse_claude(v: &Value, plan: Option<String>) -> Result<Quota, FetchError
             detail: None,
         })
     };
-    let windows: Vec<Window> = [win("five_hour", "5h", "5 小時"), win("seven_day", "週", "每週")]
+    let windows: Vec<Window> = [win("five_hour", "5H", "5 小時"), win("seven_day", "7D", "每週")]
         .into_iter()
         .flatten()
         .collect();
@@ -214,19 +216,58 @@ fn quiet(cmd: &mut Command) -> &mut Command {
     cmd.creation_flags(CREATE_NO_WINDOW)
 }
 
-fn gh_token() -> Result<String, FetchError> {
-    let out = quiet(Command::new("gh").args(["auth", "token"]))
+/// 使用者選的 Copilot 帳號（gh 登入的 github.com 帳號名稱）；None 表示用 gh 目前的帳號。
+static COPILOT_LOGIN: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+pub fn set_copilot_login(login: Option<String>) {
+    *COPILOT_LOGIN.lock().unwrap() = login;
+}
+
+pub fn copilot_login() -> Option<String> {
+    COPILOT_LOGIN.lock().unwrap().clone()
+}
+
+/// gh 在 github.com 上登入的所有帳號，第二個值表示是否為 gh 目前使用的帳號。
+pub fn gh_accounts() -> Vec<(String, bool)> {
+    let Ok(out) = quiet(Command::new("gh").args(["auth", "status", "--json", "hosts"])).output() else {
+        return vec![];
+    };
+    parse_gh_accounts(&String::from_utf8_lossy(&out.stdout))
+}
+
+pub fn parse_gh_accounts(json: &str) -> Vec<(String, bool)> {
+    let v: Value = serde_json::from_str(json).unwrap_or_default();
+    v["hosts"]["github.com"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|a| a["state"].as_str() == Some("success"))
+        .filter_map(|a| Some((a["login"].as_str()?.to_string(), a["active"].as_bool() == Some(true))))
+        .collect()
+}
+
+fn gh_token(login: Option<&str>) -> Result<String, FetchError> {
+    let mut cmd = Command::new("gh");
+    cmd.args(["auth", "token", "--hostname", "github.com"]);
+    if let Some(l) = login {
+        cmd.args(["--user", l]);
+    }
+    let out = quiet(&mut cmd)
         .output()
         .map_err(|_| FetchError::NotSetUp("需要 GitHub CLI（gh）登入才能查 Copilot".into()))?;
     let tok = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if !out.status.success() || tok.is_empty() {
-        return Err(FetchError::NotSetUp("GitHub CLI 尚未登入（執行 gh auth login）".into()));
+        return Err(FetchError::NotSetUp(match login {
+            Some(l) => format!("GitHub CLI 沒有登入 {l}（執行 gh auth login）"),
+            None => "GitHub CLI 尚未登入（執行 gh auth login）".into(),
+        }));
     }
     Ok(tok)
 }
 
 fn copilot() -> Result<Quota, FetchError> {
-    let token = gh_token()?;
+    let login = copilot_login();
+    let token = gh_token(login.as_deref())?;
     let (status, body) = http::get(
         "api.github.com",
         "/copilot_internal/user",
@@ -246,7 +287,16 @@ fn copilot() -> Result<Quota, FetchError> {
     if status != 200 {
         return Err(http_error("Copilot", status, &body));
     }
-    parse_copilot(&parse_body("Copilot", &body)?)
+    let v = parse_body("Copilot", &body)?;
+    let mut q = parse_copilot(&v)?;
+    // 提示文字標出是哪個帳號。
+    if let Some(user) = v["login"].as_str() {
+        q.plan = Some(match q.plan {
+            Some(p) => format!("{p} · {user}"),
+            None => user.to_string(),
+        });
+    }
+    Ok(q)
 }
 
 pub fn parse_copilot(v: &Value) -> Result<Quota, FetchError> {
@@ -259,9 +309,9 @@ pub fn parse_copilot(v: &Value) -> Result<Quota, FetchError> {
         .and_then(parse_time);
     let snaps = &v["quota_snapshots"];
     let windows: Vec<Window> = [
-        ("premium_interactions", "進階", "進階請求"),
-        ("chat", "聊天", "聊天"),
-        ("completions", "補全", "程式碼補全"),
+        ("premium_interactions", "PREM", "進階請求"),
+        ("chat", "CHAT", "聊天"),
+        ("completions", "CODE", "程式碼補全"),
     ]
     .iter()
     .filter_map(|(key, short, name)| {
@@ -353,7 +403,7 @@ pub fn parse_antigravity(v: &Value) -> Result<Quota, FetchError> {
     let mut extra = Vec::new();
     for g in v["command"]["data"]["groups"].as_array().into_iter().flatten() {
         let gname = g["name"].as_str().unwrap_or("?");
-        let short = if gname.starts_with("Gemini") { "Gem" } else { "C+G" };
+        let short = if gname.starts_with("Gemini") { "GEM" } else { "C+G" };
         let mut buckets: Vec<Window> = g["buckets"]
             .as_array()
             .into_iter()
@@ -403,9 +453,9 @@ mod tests {
     fn claude_fixture() {
         let q = parse_claude(&fixture("claude"), Some("pro".into())).unwrap();
         assert_eq!(q.windows.len(), 2);
-        assert_eq!(q.windows[0].short, "5h");
+        assert_eq!(q.windows[0].short, "5H");
         assert!(q.windows[0].resets_at.is_some());
-        assert_eq!(q.windows[1].short, "週");
+        assert_eq!(q.windows[1].short, "7D");
         assert!(q.extra.is_empty());
     }
 
@@ -420,7 +470,7 @@ mod tests {
         let v = fixture("codex");
         let q = parse_codex(&v, 0).unwrap();
         assert_eq!(q.windows.len(), 1, "secondary_window 是 null");
-        assert_eq!(q.windows[0].short, "月");
+        assert_eq!(q.windows[0].short, "30D");
         assert_eq!(q.windows[0].resets_at, v["rate_limit"]["primary_window"]["reset_at"].as_i64());
         assert_eq!(q.plan.as_deref(), Some("free"));
     }
@@ -431,9 +481,9 @@ mod tests {
             "primary_window": {"used_percent": 12, "limit_window_seconds": 18000, "reset_after_seconds": 60},
             "secondary_window": {"used_percent": 40, "limit_window_seconds": 604800, "reset_at": 99}}});
         let q = parse_codex(&v, 1000).unwrap();
-        assert_eq!(q.windows[0].short, "5h");
+        assert_eq!(q.windows[0].short, "5H");
         assert_eq!(q.windows[0].resets_at, Some(1060));
-        assert_eq!(q.windows[1].short, "週");
+        assert_eq!(q.windows[1].short, "7D");
         assert_eq!(q.windows[1].used, 40.0);
     }
 
@@ -441,16 +491,40 @@ mod tests {
     fn copilot_free_skips_zero_premium() {
         let q = parse_copilot(&fixture("copilot")).unwrap();
         let shorts: Vec<&str> = q.windows.iter().map(|w| w.short.as_str()).collect();
-        assert_eq!(shorts, ["聊天", "補全"]);
+        assert_eq!(shorts, ["CHAT", "CODE"]);
         assert!((q.windows[0].used - 0.3).abs() < 1e-9);
         assert_eq!(q.windows[0].resets_at, parse_time("2026-12-01"));
+    }
+
+    #[test]
+    fn gh_accounts_from_status_json() {
+        let j = r#"{"hosts":{"github.com":[
+            {"state":"success","active":true,"host":"github.com","login":"me"},
+            {"state":"success","active":false,"host":"github.com","login":"me_work"},
+            {"state":"error","active":false,"host":"github.com","login":"broken"}]}}"#;
+        assert_eq!(parse_gh_accounts(j), vec![("me".into(), true), ("me_work".into(), false)]);
+        assert!(parse_gh_accounts("not json").is_empty());
+    }
+
+    #[test]
+    fn copilot_business_premium_only() {
+        let v = serde_json::json!({"access_type_sku": "copilot_for_business_seat_quota",
+            "quota_reset_date_utc": "2026-12-01T00:00:00.000Z", "quota_snapshots": {
+            "chat": {"unlimited": true, "entitlement": 0, "percent_remaining": 100.0},
+            "completions": {"unlimited": true, "entitlement": 0, "percent_remaining": 100.0},
+            "premium_interactions": {"unlimited": false, "entitlement": 1900, "remaining": 714, "percent_remaining": 37.5}}});
+        let q = parse_copilot(&v).unwrap();
+        assert_eq!(q.windows.len(), 1);
+        assert_eq!(q.windows[0].short, "PREM");
+        assert_eq!(q.windows[0].used, 62.5);
+        assert_eq!(q.windows[0].detail.as_deref(), Some("剩 714 / 1900 次"));
     }
 
     #[test]
     fn antigravity_fixture() {
         let q = parse_antigravity(&fixture("antigravity")).unwrap();
         assert_eq!(q.windows.len(), 2);
-        assert_eq!(q.windows[0].short, "Gem");
+        assert_eq!(q.windows[0].short, "GEM");
         assert!((q.windows[0].used - 41.998).abs() < 0.01, "取 5 小時（較緊）");
         assert_eq!(q.windows[1].short, "C+G");
         assert!((q.windows[1].used - 50.87).abs() < 0.01, "取每週（較緊）");

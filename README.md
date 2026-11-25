@@ -2,15 +2,18 @@
 
 在 Windows 工作列時鐘旁，一眼看到各家 AI 訂閱還剩多少額度。
 
+深色 HUD 面板：霓虹青邊框與四角括號、LED 分段進度條、等寬數字。每家用自己 App 的圖示代表，右下角的狀態燈依最緊的額度變色。
+
 ```
-Claude 5h 28%   Codex 月 0%   Copilot 聊天 0%   AG Gem 41%
-       週 32%                         補全 0%      C+G 51%
+[Claude圖示] 5H ▮▮▮▯▯▯▯▯ 36%   [OpenAI圖示] 30D ▯▯▯▯▯▯▯▯ 0%   [GitHub圖示] PREM ▮▮▮▮▮▯▯▯ 63%   [Antigravity圖示] GEM ▮▮▯▯▯▯▯▯ 18%
+             7D ▮▮▮▮▯▯▯▯ 39%                                                                                 C+G ▮▮▮▮▯▯▯▯ 51%
 ```
 
 - 支援 **Claude**（5 小時、每週）、**Codex**（依方案的 5 小時／每週／30 天）、**GitHub Copilot**（每月聊天、補全、進階請求）、**Antigravity**（Gemini 與 Claude/GPT 兩組，各取較緊的一個）。
 - 直接讀各工具已經存好的登入資料，不用另外輸入帳號密碼或 API key。唯一會寫回的是 Claude 的登入檔（見下方「Claude 登入自動更新」），其他家只讀不寫。
 - 單一 EXE（約 350 KB），沒有任何遙測，資料只送往各家官方伺服器。
-- 用量 75% 以上變橘、90% 以上變紅；資料過期時淡化顯示。
+- 用量 75% 以上變琥珀色、90% 以上變紅；資料過期時圖示轉灰、整塊淡化。
+- 圖示在執行時從本機已安裝的 App 讀取（Claude、Codex、GitHub Copilot、Antigravity 桌面版），程式本身不帶任何商標圖檔；找不到 App 時改顯示名稱文字。
 
 ## 使用方式
 
@@ -18,7 +21,7 @@ Claude 5h 28%   Codex 月 0%   Copilot 聊天 0%   AG Gem 41%
 | --- | --- |
 | 滑鼠移到上面 | 顯示每一個額度的詳細用量與重置時間 |
 | 左鍵 | 立即更新 |
-| 右鍵 | 選單：立即更新、顯示／隱藏各家、開啟 Claude 用量頁面、開機時自動啟動、結束 |
+| 右鍵 | 選單：立即更新、顯示／隱藏各家、Copilot 帳號、開啟 Claude 用量頁面、開機時自動啟動、結束 |
 
 自動更新間隔：Claude、Codex、Copilot 每 2 分鐘；Antigravity 每 10 分鐘（每次要啟動 CLI）。
 
@@ -28,7 +31,7 @@ Claude 5h 28%   Codex 月 0%   Copilot 聊天 0%   AG Gem 41%
 | --- | --- | --- |
 | Claude | `%USERPROFILE%\.claude\.credentials.json`（Claude Code 登入訂閱帳號） | 執行 `claude` 登入 |
 | Codex | `%USERPROFILE%\.codex\auth.json`（Codex 用 ChatGPT 帳號登入） | 執行 `codex` 登入 |
-| Copilot | `gh auth token`（GitHub CLI） | 執行 `gh auth login` |
+| Copilot | `gh auth token`（GitHub CLI）；gh 登入多個帳號時，右鍵選單「Copilot 帳號」可選要顯示哪一個（例如個人或公司） | 執行 `gh auth login` |
 | Antigravity | `%LOCALAPPDATA%\agy\bin\agy.exe -p /usage` | 安裝並登入 Antigravity CLI |
 
 找不到登入資料的那家不會出現在工作列上。
