@@ -43,7 +43,7 @@ fn request(
 ) -> Result<(u32, String), String> {
     unsafe {
         let session = Handle(WinHttpOpen(
-            wide("ai-quota-bar/0.1").as_ptr(),
+            wide(concat!("ai-quota-bar/", env!("CARGO_PKG_VERSION"))).as_ptr(),
             WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
             null(),
             null(),
