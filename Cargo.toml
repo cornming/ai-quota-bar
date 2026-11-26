@@ -1,6 +1,6 @@
 [package]
 name = "ai-quota-bar"
-version = "0.7.0"
+version = "0.7.1"
 description = "在 Windows 工作列時鐘旁顯示 AI 訂閱額度（Claude、Codex、Copilot、Antigravity）"
 license = "MIT"
 edition = "2021"

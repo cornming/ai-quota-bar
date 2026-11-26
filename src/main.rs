@@ -950,7 +950,9 @@ unsafe fn tray_add(ctl: HWND) {
     nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     nid.uCallbackMessage = WM_APP_TRAY;
     nid.hIcon = make_icon(size, &render::tray_icon(size));
-    let tip: Vec<u16> = "AI Quota Bar（左鍵：顯示／隱藏，右鍵：選單）".encode_utf16().collect();
+    let tip: Vec<u16> = format!("AI Quota Bar v{}（左鍵：顯示／隱藏，右鍵：選單）", updater::CURRENT_VERSION)
+        .encode_utf16()
+        .collect();
     let n = tip.len().min(nid.szTip.len() - 1);
     nid.szTip[..n].copy_from_slice(&tip[..n]);
     Shell_NotifyIconW(NIM_ADD, &nid);
@@ -1122,6 +1124,13 @@ unsafe fn show_menu() {
         let flags = MF_STRING | if checked { MF_CHECKED } else { MF_UNCHECKED };
         AppendMenuW(menu, flags, id, wide(text).as_ptr());
     };
+    AppendMenuW(
+        menu,
+        MF_STRING | MF_GRAYED,
+        0,
+        wide(&format!("AI Quota Bar v{}", updater::CURRENT_VERSION)).as_ptr(),
+    );
+    AppendMenuW(menu, MF_SEPARATOR, 0, null());
     add(CMD_REFRESH, "立即更新", false);
     AppendMenuW(menu, MF_SEPARATOR, 0, null());
     for p in ALL {
@@ -1191,7 +1200,7 @@ unsafe fn show_menu() {
         } else if let Some(info) = &u.available {
             add(CMD_UPDATE, &format!("更新到 {}…", info.tag), false);
         } else {
-            add(CMD_UPDATE, &format!("檢查更新（v{}）", updater::CURRENT_VERSION), false);
+            add(CMD_UPDATE, "檢查更新", false);
         }
     }
     add(CMD_OPEN_CLAUDE, "開啟 Claude 用量頁面", false);
