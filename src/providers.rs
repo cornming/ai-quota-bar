@@ -253,9 +253,17 @@ pub fn copilot_login() -> Option<String> {
     COPILOT_LOGIN.lock().unwrap().clone()
 }
 
+/// 執行 `gh` 時優先用最新偵測到的路徑，剛安裝完不必重開程式。
+fn gh_cmd() -> Command {
+    match crate::setup::find_gh() {
+        Some(p) => Command::new(p),
+        None => Command::new("gh"),
+    }
+}
+
 /// gh 在 github.com 上登入的所有帳號，第二個值表示是否為 gh 目前使用的帳號。
 pub fn gh_accounts() -> Vec<(String, bool)> {
-    let Ok(out) = quiet(Command::new("gh").args(["auth", "status", "--json", "hosts"])).output() else {
+    let Ok(out) = quiet(gh_cmd().args(["auth", "status", "--json", "hosts"])).output() else {
         return vec![];
     };
     parse_gh_accounts(&String::from_utf8_lossy(&out.stdout))
@@ -273,7 +281,7 @@ pub fn parse_gh_accounts(json: &str) -> Vec<(String, bool)> {
 }
 
 fn gh_token(login: Option<&str>) -> Result<String, FetchError> {
-    let mut cmd = Command::new("gh");
+    let mut cmd = gh_cmd();
     cmd.args(["auth", "token", "--hostname", "github.com"]);
     if let Some(l) = login.filter(|l| valid_login(l)) {
         cmd.arg(format!("--user={l}"));
@@ -369,9 +377,7 @@ pub fn parse_copilot(v: &Value) -> Result<Quota, FetchError> {
 // ---------- Antigravity ----------
 
 fn agy_path() -> Option<PathBuf> {
-    let local = std::env::var_os("LOCALAPPDATA").map(PathBuf::from)?;
-    let p = local.join("agy").join("bin").join("agy.exe");
-    p.is_file().then_some(p)
+    crate::setup::find_agy()
 }
 
 /// 執行 `agy -p /usage --output-format json`。
@@ -400,9 +406,13 @@ fn antigravity() -> Result<Quota, FetchError> {
     // 正常的 /usage 約 3 秒；被當成提問時要 40 秒以上。逾時就當成誤送提問，直接停用，
     // 不然每 10 分鐘就會再送一次真的提問。
     let deadline = Instant::now() + Duration::from_secs(20);
+    let exit_ok;
     loop {
         match child.try_wait() {
-            Ok(Some(_)) => break,
+            Ok(Some(st)) => {
+                exit_ok = st.success();
+                break;
+            }
             Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(100)),
             _ => {
                 let _ = child.kill();
@@ -414,8 +424,17 @@ fn antigravity() -> Result<Quota, FetchError> {
         }
     }
     let out = reader.join().unwrap_or_default();
-    let v: Value = serde_json::from_str(out.trim_start_matches('\u{feff}').trim())
-        .map_err(|_| FetchError::Other("agy 回應格式無法辨識".into()))?;
+    let trimmed = out.trim_start_matches('\u{feff}').trim();
+    if trimmed.is_empty() && !exit_ok {
+        return Err(FetchError::NotSetUp("Antigravity CLI 尚未登入（請執行 agy 完成登入）".into()));
+    }
+    let v: Value = serde_json::from_str(trimmed).map_err(|_| {
+        if !exit_ok {
+            FetchError::NotSetUp("Antigravity CLI 尚未登入或查詢失敗（請執行 agy 檢查）".into())
+        } else {
+            FetchError::Other("agy 回應格式無法辨識".into())
+        }
+    })?;
     parse_antigravity(&v, AGY_PERIOD.load(Ordering::Relaxed))
 }
 

@@ -11,8 +11,10 @@ mod http;
 mod icons;
 mod model;
 mod providers;
-mod taskbar;
 mod render;
+mod setup;
+mod taskbar;
+mod wizard;
 
 use http::wide;
 use model::*;
@@ -51,10 +53,12 @@ const CMD_COPILOT_BASE: usize = 100;
 const CMD_MONITOR_BASE: usize = 200;
 const CMD_TOGGLE_WIDGET: usize = 22;
 const CMD_SHOW_REMAINING: usize = 23;
+const CMD_OPEN_SETUP: usize = 24;
 const CMD_THEME_BASE: usize = 300;
 const THEME_NAMES: [&str; 3] = ["跟隨系統", "深色", "淺色"];
 const CMD_AGY_BASE: usize = 400;
 const WM_APP_TRAY: u32 = WM_APP + 2;
+const WM_APP_SETUP_DONE: u32 = WM_APP + 3;
 const TRAY_ID: u32 = 1;
 
 const REG_APP: &str = "Software\\AiQuotaBar";
@@ -151,6 +155,64 @@ fn notify(updated: bool) {
     }
 }
 
+/// 通知 UI 執行緒某家服務的 PowerShell 設定視窗已關閉。
+pub(crate) fn post_setup_done(idx: usize) {
+    let ctl = CTL.load(Ordering::Relaxed);
+    if ctl != 0 {
+        unsafe { PostMessageW(ctl as HWND, WM_APP_SETUP_DONE, idx, 0) };
+    }
+}
+
+/// 整理四家服務在環境設定精靈裡的狀態。
+pub(crate) fn build_setup_items(cli: &[bool; 4], running: &[bool; 4]) -> Vec<setup::ItemStatus> {
+    ALL.iter()
+        .map(|&p| {
+            let s = slot(p);
+            setup::diagnose(p, s.done, s.quota.as_ref(), s.error.as_ref(), cli[p.index()], running[p.index()])
+        })
+        .collect()
+}
+
+/// 還有任一未隱藏的服務尚未完成首次查詢。
+fn any_pending() -> bool {
+    ALL.iter().any(|&p| !HIDDEN[p.index()].load(Ordering::Relaxed) && !slot(p).done)
+}
+
+/// 目前是否完全沒有可顯示的額度區塊（且已經查完一輪），應提示點此設定。
+fn needs_setup_banner() -> bool {
+    if any_pending() {
+        return false;
+    }
+    for p in ALL {
+        if HIDDEN[p.index()].load(Ordering::Relaxed) {
+            continue;
+        }
+        let s = slot(p);
+        match (&s.quota, &s.error) {
+            (Some(_), _) => return false,
+            (None, Some(FetchError::NotSetUp(_) | FetchError::Disabled(_))) | (None, None) => {}
+            (None, Some(_)) => return false,
+        }
+    }
+    true
+}
+
+/// 所有未隱藏的服務都已查完，且全都找不到環境（NotSetUp）。
+fn all_unconfigured() -> bool {
+    let mut visible = 0usize;
+    for p in ALL {
+        if HIDDEN[p.index()].load(Ordering::Relaxed) {
+            continue;
+        }
+        visible += 1;
+        let s = slot(p);
+        if !s.done || s.quota.is_some() || !matches!(s.error, Some(FetchError::NotSetUp(_))) {
+            return false;
+        }
+    }
+    visible > 0
+}
+
 // ---------- UI 狀態（只在 UI 執行緒用） ----------
 
 struct Ui {
@@ -182,6 +244,16 @@ struct Ui {
     show_remaining: bool,
     /// 主題：0 跟隨系統、1 深色、2 淺色。
     theme: u32,
+    /// 本次啟動是否已檢查過「四家全都沒環境就自動跳設定精靈」。
+    setup_auto_checked: bool,
+}
+
+fn current_light(u: &Ui) -> bool {
+    match u.theme {
+        1 => false,
+        2 => true,
+        _ => !u.dark,
+    }
 }
 
 thread_local! {
@@ -342,7 +414,12 @@ fn tooltip_lines() -> Vec<render::TipLine> {
             }
         }
     }
-    lines.push(line(TipKind::Footer, "左鍵：立即更新　右鍵：選單".into(), None));
+    let footer = if needs_setup_banner() {
+        "左鍵：開啟環境設定　右鍵：選單"
+    } else {
+        "左鍵：立即更新　右鍵：選單"
+    };
+    lines.push(line(TipKind::Footer, footer.into(), None));
     lines
 }
 
@@ -398,17 +475,26 @@ fn build_model(dark: bool, light: bool, hover: bool, show_remaining: bool) -> re
         }
     }
     if blocks.is_empty() {
-        blocks.push(render::Block {
-            provider: None,
-            name: "AI QUOTA".into(),
-            rows: vec![render::Row { label: "...".into(), used: None }],
-            stale: true,
-        });
+        if any_pending() {
+            blocks.push(render::Block {
+                provider: None,
+                name: "AI QUOTA 檢查中…".into(),
+                rows: vec![],
+                stale: true,
+            });
+        } else {
+            blocks.push(render::Block {
+                provider: None,
+                name: "點此設定 AI 環境".into(),
+                rows: vec![],
+                stale: false,
+            });
+        }
     }
     render::Model { blocks, dark, light, hover, show_remaining }
 }
 
-unsafe fn present(widget: HWND, f: &render::Frame) {
+pub(crate) unsafe fn present(widget: HWND, f: &render::Frame) {
     let dc = CreateCompatibleDC(null_mut());
     let bmi = BITMAPINFO {
         bmiHeader: BITMAPINFOHEADER {
@@ -665,6 +751,54 @@ fn refresh_all() {
     });
 }
 
+/// 精靈觸發重新檢查：清除圖示快取並重新查詢額度。
+pub(crate) fn refresh_after_setup(only: Option<usize>) {
+    icons::clear_cache();
+    with(|u| {
+        u.rendered = None;
+        match only {
+            Some(i) if i < u.workers.len() => {
+                let _ = u.workers[i].send(());
+            }
+            _ => {
+                for tx in &u.workers {
+                    let _ = tx.send(());
+                }
+            }
+        }
+    });
+    ensure_widget();
+    update_tip();
+}
+
+/// 若該服務原本被使用者隱藏，在精靈按下安裝／登入時自動取消隱藏。
+pub(crate) fn unhide_provider(p: Provider) {
+    if HIDDEN[p.index()].swap(false, Ordering::Relaxed) {
+        save_hidden();
+        with(|u| {
+            let _ = u.workers[p.index()].send(());
+        });
+    }
+}
+
+unsafe fn open_setup() {
+    hide_tip();
+    let (anchor, light) = with(|u| (u.widget, current_light(u)));
+    wizard::open(anchor, light);
+}
+
+/// 四家首次查完且全都沒有環境時，自動開啟設定精靈一次（記在登錄檔避免日後重複打擾）。
+unsafe fn maybe_auto_open_setup() {
+    if any_pending() || with(|u| u.setup_auto_checked) {
+        return;
+    }
+    with(|u| u.setup_auto_checked = true);
+    if all_unconfigured() && reg_get_dword(HKEY_CURRENT_USER, REG_APP, "SetupPrompted") != Some(1) {
+        reg_set_dword(REG_APP, "SetupPrompted", 1);
+        open_setup();
+    }
+}
+
 /// 隱藏／顯示整個工作列小工具（設定會記住）。
 fn toggle_widget() {
     let hidden = with(|u| {
@@ -745,8 +879,10 @@ unsafe fn show_menu() {
     for p in ALL {
         let s = slot(p);
         let mut label = format!("顯示 {}", p.name());
-        if let Some(FetchError::NotSetUp(_) | FetchError::Disabled(_)) = &s.error {
-            label += "（無法使用）";
+        match &s.error {
+            Some(FetchError::NotSetUp(_)) => label += "（尚未設定）",
+            Some(FetchError::Disabled(_)) => label += "（已停用）",
+            _ => {}
         }
         add(CMD_TOGGLE_BASE + p.index(), &label, !HIDDEN[p.index()].load(Ordering::Relaxed));
     }
@@ -796,6 +932,7 @@ unsafe fn show_menu() {
     AppendMenuW(menu, MF_POPUP, theme_menu as usize, wide("主題").as_ptr());
     add(CMD_TOGGLE_WIDGET, if hidden_now { "顯示工作列小工具" } else { "隱藏工作列小工具" }, false);
     AppendMenuW(menu, MF_SEPARATOR, 0, null());
+    add(CMD_OPEN_SETUP, "環境設定…", false);
     add(CMD_OPEN_CLAUDE, "開啟 Claude 用量頁面", false);
     add(CMD_AUTOSTART, "開機時自動啟動", reg_has_value(REG_RUN, RUN_NAME));
     AppendMenuW(menu, MF_SEPARATOR, 0, null());
@@ -810,6 +947,7 @@ unsafe fn show_menu() {
     DestroyMenu(menu);
     match cmd {
         CMD_REFRESH => refresh_all(),
+        CMD_OPEN_SETUP => open_setup(),
         CMD_AUTOSTART => set_autostart(!reg_has_value(REG_RUN, RUN_NAME)),
         CMD_OPEN_CLAUDE => {
             ShellExecuteW(null_mut(), w!("open"), w!("https://claude.ai/settings/usage"), null(), null(), SW_SHOWNORMAL);
@@ -830,9 +968,13 @@ unsafe fn show_menu() {
         }
         c if (CMD_THEME_BASE..CMD_THEME_BASE + THEME_NAMES.len()).contains(&c) => {
             let t = (c - CMD_THEME_BASE) as u32;
-            with(|u| u.theme = t);
+            let light = with(|u| {
+                u.theme = t;
+                current_light(u)
+            });
             reg_set_dword(REG_APP, "Theme", t);
             ensure_widget();
+            wizard::sync(light, false);
         }
         CMD_SHOW_REMAINING => {
             let on = with(|u| {
@@ -886,9 +1028,17 @@ unsafe extern "system" fn ctl_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
         WM_APP_DATA => {
             ensure_widget();
             update_tip();
+            maybe_auto_open_setup();
+            wizard::sync(with(|u| current_light(u)), false);
             if wp == 1 {
                 start_sheen();
             }
+            0
+        }
+        WM_APP_SETUP_DONE => {
+            let light = with(|u| current_light(u));
+            wizard::on_provider_done(wp, light);
+            refresh_after_setup(None);
             0
         }
         WM_TIMER if wp == TIMER_ANIM => {
@@ -901,9 +1051,13 @@ unsafe extern "system" fn ctl_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
             0
         }
         WM_SETTINGCHANGE => {
-            with(|u| u.dark = system_dark());
+            let light = with(|u| {
+                u.dark = system_dark();
+                current_light(u)
+            });
             ensure_widget();
             update_tip();
+            wizard::sync(light, false);
             0
         }
         WM_APP_TRAY => {
@@ -926,6 +1080,7 @@ unsafe extern "system" fn ctl_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
             if !widget.is_null() && IsWindow(widget) != 0 {
                 DestroyWindow(widget);
             }
+            wizard::close();
             if !tip.is_null() {
                 DestroyWindow(tip);
             }
@@ -972,7 +1127,11 @@ unsafe extern "system" fn widget_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -
             0
         }
         WM_LBUTTONUP => {
-            refresh_all();
+            if needs_setup_banner() {
+                open_setup();
+            } else {
+                refresh_all();
+            }
             0
         }
         WM_RBUTTONUP => {
@@ -1047,12 +1206,15 @@ fn main() {
         dump(args.get(i + 1).map(String::as_str).unwrap_or("ai-quota-dump.txt"));
         return;
     }
+    let open_setup_arg = args.iter().any(|a| a == "--setup");
     unsafe {
         CreateMutexW(null(), 0, w!("Local\\AiQuotaBar"));
         if GetLastError() == ERROR_ALREADY_EXISTS {
             return;
         }
         let hinst = GetModuleHandleW(null());
+        let app_icon = make_icon(32, &render::tray_icon(32));
+        wizard::register(hinst, app_icon);
         for (name, proc_) in [
             (w!("AiQuotaBarCtl"), ctl_proc as unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT),
             (w!("AiQuotaBarWidget"), widget_proc),
@@ -1105,6 +1267,7 @@ fn main() {
                 widget_hidden: reg_get_dword(HKEY_CURRENT_USER, REG_APP, "WidgetHidden") == Some(1),
                 show_remaining: reg_get_dword(HKEY_CURRENT_USER, REG_APP, "ShowRemaining") == Some(1),
                 theme: reg_get_dword(HKEY_CURRENT_USER, REG_APP, "Theme").filter(|v| *v <= 2).unwrap_or(0),
+                setup_auto_checked: false,
             })
         });
         CTL.store(ctl as isize, Ordering::Relaxed);
@@ -1113,6 +1276,10 @@ fn main() {
         with(|u| u.workers = workers);
         tray_add(ctl);
         ensure_widget();
+        if open_setup_arg {
+            with(|u| u.setup_auto_checked = true);
+            open_setup();
+        }
         // 系統匣寬度會變（圖示增減），定時重新對齊。
         SetTimer(ctl, TIMER_PLACE, 2000, None);
 

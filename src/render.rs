@@ -242,12 +242,20 @@ impl Canvas {
     }
 
     fn into_frame(self) -> Frame {
+        self.finish(true)
+    }
+
+    fn into_frame_exact(self) -> Frame {
+        self.finish(false)
+    }
+
+    fn finish(self, min_alpha: bool) -> Frame {
         let px = self
             .px
             .iter()
             .map(|p| {
-                // 完全透明的像素滑鼠會穿透，保留最低 alpha 讓整塊都能點。
-                let a = p[3].max(1.0 / 255.0);
+                // 工作列小工具用最低 alpha 讓整塊都能點；獨立視窗保留真實透明度讓陰影外可穿透。
+                let a = if min_alpha { p[3].max(1.0 / 255.0) } else { p[3].clamp(0.0, 1.0) };
                 let q = |v: f32| (v * a * 255.0).round().clamp(0.0, 255.0) as u8;
                 [q(p[2]), q(p[1]), q(p[0]), (a * 255.0).round() as u8]
             })
@@ -303,6 +311,25 @@ impl TextMask {
         let mut tm: TEXTMETRICW = std::mem::zeroed();
         GetTextMetricsW(self.dc, &mut tm);
         tm.tmAscent
+    }
+
+    /// 裁切超過 `max_w` 的文字並加上省略號「…」。
+    unsafe fn fit_text(&self, s: &str, max_w: i32) -> String {
+        if max_w <= 0 || self.measure(s).0 <= max_w {
+            return s.to_string();
+        }
+        let ell_w = self.measure("…").0;
+        let mut out = String::new();
+        for ch in s.chars() {
+            let mut next = out.clone();
+            next.push(ch);
+            if self.measure(&next).0 + ell_w > max_w {
+                break;
+            }
+            out = next;
+        }
+        out.push('…');
+        out
     }
 
     /// 在畫布上畫字，`baseline` 是基線的 y。
@@ -387,6 +414,7 @@ pub fn render(m: &Model, h: i32, scale: f32) -> Frame {
     let th = theme(m.light);
     unsafe {
         let name_font = TextMask::new(s(9.5), 600, "Bahnschrift");
+        let hint_font = TextMask::new(s(11.5), 600, "Microsoft JhengHei UI");
         let label_font = TextMask::new(s(10.0), 600, "Cascadia Mono");
         let value_font = TextMask::new(s(11.0), 700, "Cascadia Mono");
 
@@ -409,20 +437,36 @@ pub fn render(m: &Model, h: i32, scale: f32) -> Frame {
             /// 圖示或「狀態燈＋名稱」的寬度。
             head_w: i32,
             label_w: i32,
+            banner: bool,
         }
         let lays: Vec<Lay> = m
             .blocks
             .iter()
             .map(|b| {
-                let icon = b.provider.and_then(|p| crate::icons::get(p, icon_size, m.light));
+                let banner = b.rows.is_empty();
+                let icon = if banner { None } else { b.provider.and_then(|p| crate::icons::get(p, icon_size, m.light)) };
+                let head_w = if icon.is_some() {
+                    icon_size
+                } else if banner {
+                    dot_w + dot_gap + s(2.0) + hint_font.measure(&b.name).0
+                } else {
+                    dot_w + dot_gap + name_font.measure(&b.name).0
+                };
                 Lay {
-                    head_w: if icon.is_some() { icon_size } else { dot_w + dot_gap + name_font.measure(&b.name).0 },
+                    head_w,
                     icon,
                     label_w: b.rows.iter().map(|r| label_font.measure(&r.label).0).max().unwrap_or(0),
+                    banner,
                 }
             })
             .collect();
-        let block_w = |l: &Lay| l.head_w + name_gap + l.label_w + col_gap + bar_w + col_gap + value_w;
+        let block_w = |l: &Lay| {
+            if l.banner {
+                l.head_w
+            } else {
+                l.head_w + name_gap + l.label_w + col_gap + bar_w + col_gap + value_w
+            }
+        };
         let content: i32 =
             lays.iter().map(block_w).sum::<i32>() + (sep_gap * 2 + 1) * (lays.len() as i32 - 1).max(0);
         let total = pad_x * 2 + content;
@@ -479,6 +523,22 @@ pub fn render(m: &Model, h: i32, scale: f32) -> Frame {
                 x += sep_gap * 2 + 1;
             }
             let a = if b.stale { STALE } else { 1.0 };
+            if lay.banner {
+                // 尚未設定或初始檢查中的橫幅樣式：狀態燈＋中文提示，不畫空的進度條。
+                let dc = if b.stale { th.idle } else { th.warn };
+                let dcx = x as f32 + dot_r;
+                let dcy = mid as f32;
+                if !b.stale {
+                    cv.glow(dcx - dot_r, dcy - dot_r, dot_r * 2.0, dot_r * 2.0, f(4.0), dc, 0.40);
+                }
+                cv.circle(dcx, dcy, dot_r, dc, 1.0);
+                let (_, th_px) = hint_font.measure("設定");
+                let hint_base = mid - th_px / 2 + hint_font.ascent();
+                let tc = if b.stale { th.label } else { th.value };
+                hint_font.draw(&mut cv, &b.name, x + dot_w + dot_gap + s(2.0), hint_base, tc, a);
+                x += block_w(lay);
+                continue;
+            }
             let dc = block_color(&th, b);
             if let Some(icon) = &lay.icon {
                 // App 圖示；過期時轉灰階並淡化。右下角疊一顆狀態燈。
@@ -741,6 +801,402 @@ pub fn tray_icon(size: i32) -> Vec<[u8; 4]> {
         .collect()
 }
 
+// ---------- 環境設定精靈 ----------
+
+use crate::providers::Provider;
+use crate::setup::{self, ItemStatus, RunMode, State};
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SetupAction {
+    Close,
+    Refresh,
+    Run(Provider, RunMode),
+    Copy(Provider),
+    Docs(Provider),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct HitBox {
+    /// [left, top, right, bottom]，以 Frame 像素為單位（含陰影偏移）。
+    pub rect: [i32; 4],
+    pub action: SetupAction,
+}
+
+impl HitBox {
+    pub fn contains(&self, x: i32, y: i32) -> bool {
+        x >= self.rect[0] && x < self.rect[2] && y >= self.rect[1] && y < self.rect[3]
+    }
+}
+
+pub struct SetupView<'a> {
+    pub items: &'a [ItemStatus],
+    pub hover: Option<SetupAction>,
+    pub pressed: Option<SetupAction>,
+    /// 底部暫時提示（例如複製成功或啟動錯誤）；None 時顯示預設操作說明。
+    pub notice: Option<&'a str>,
+    pub light: bool,
+}
+
+#[derive(Clone, Copy)]
+enum BtnStyle {
+    Accent,
+    Warn,
+    Ghost,
+    Disabled,
+}
+
+/// 畫出環境設定精靈 HUD 視窗；回傳畫面、陰影偏移量、以及所有按鈕的點擊區域。
+pub fn setup_wizard(view: &SetupView<'_>, scale: f32) -> (Frame, i32, Vec<HitBox>) {
+    let s = |v: f32| (v * scale).round() as i32;
+    let f = |v: f32| v * scale;
+    let th = theme(view.light);
+    let ready_c = if view.light { hex(0x0E8F5B) } else { hex(0x1CE89B) };
+    let head_c = if view.light { hex(0x07657F) } else { hex(0x8FE8FF) };
+    let card_bg = if view.light { hex(0xFFFFFF) } else { hex(0x0C1520) };
+    let code_bg = if view.light { hex(0xEAF2F7) } else { hex(0x070E17) };
+
+    unsafe {
+        let title_f = TextMask::new(s(16.0), 700, "Microsoft JhengHei UI");
+        let name_f = TextMask::new(s(14.5), 700, "Microsoft JhengHei UI");
+        let body_f = TextMask::new(s(12.5), 400, "Microsoft JhengHei UI");
+        let small_f = TextMask::new(s(11.5), 600, "Microsoft JhengHei UI");
+        let btn_f = TextMask::new(s(12.0), 600, "Microsoft JhengHei UI");
+        let btn_sm_f = TextMask::new(s(11.0), 400, "Microsoft JhengHei UI");
+        let mono_f = TextMask::new(s(11.0), 400, "Cascadia Mono");
+        let badge_f = TextMask::new(s(12.0), 700, "Cascadia Mono");
+
+        let shadow = s(14.0);
+        let pad_x = s(22.0);
+        let pad_y = s(18.0);
+        let card_w = s(652.0);
+        let inner_w = card_w - pad_x * 2;
+        let header_h = s(56.0);
+        let header_gap = s(12.0);
+        let item_h = s(88.0);
+        let item_gap = s(10.0);
+        let footer_gap = s(14.0);
+        let footer_h = s(42.0);
+        let items_h = view.items.len() as i32 * item_h + (view.items.len() as i32 - 1).max(0) * item_gap;
+        let card_h = pad_y + header_h + header_gap + items_h + footer_gap + footer_h + s(14.0);
+
+        let (w, h) = (card_w + shadow * 2, card_h + shadow * 2);
+        let mut cv = Canvas::new(w, h);
+        let (x0, y0, cw, ch) = (shadow as f32, shadow as f32, card_w as f32, card_h as f32);
+        let radius = f(8.0);
+
+        // 外框柔和陰影。
+        let dy = f(4.0);
+        let n = shadow.max(1);
+        for k in 0..n {
+            let e = k as f32;
+            let a = 0.055 * (1.0 - e / n as f32).powi(2) * if view.light { 0.55 } else { 1.0 };
+            cv.rrect(x0 - e, y0 - e + dy, cw + 2.0 * e, ch + 2.0 * e, radius + e, hex(0x000000), a, None);
+        }
+        cv.rrect(x0, y0, cw, ch, radius, th.panel, 0.99, Some(th.panel_top));
+        // 淡掃描線。
+        let step = s(4.0).max(2);
+        let mut sy = y0 as i32 + 2;
+        while (sy as f32) < y0 + ch - 2.0 {
+            for sx in (x0 as i32 + 3)..((x0 + cw) as i32 - 3) {
+                cv.blend(sx, sy, th.accent, th.scan_alpha * 0.8);
+            }
+            sy += step;
+        }
+        cv.rrect_stroke(x0 + 0.5, y0 + 0.5, cw - 1.0, ch - 1.0, radius, 1.0, th.accent, th.border_alpha.1);
+
+        // 四角 HUD 括號。
+        let arm = s(10.0);
+        let t = s(1.5).max(1);
+        let (l, tp, r, b) = (x0 as i32, y0 as i32, (x0 + cw) as i32, (y0 + ch) as i32);
+        for (cx, cy, dx, dy) in [(l, tp, 1, 1), (r, tp, -1, 1), (l, b, 1, -1), (r, b, -1, -1)] {
+            let hx = if dx > 0 { cx } else { cx - arm };
+            let vy = if dy > 0 { cy } else { cy - arm };
+            let hy = if dy > 0 { cy } else { cy - t };
+            let vx = if dx > 0 { cx } else { cx - t };
+            cv.fill(hx, hy, arm, t, th.accent, 0.92);
+            cv.fill(vx, vy, t, arm, th.accent, 0.92);
+        }
+
+        let mut hits = Vec::new();
+
+        // 畫一顆按鈕並記錄點擊區域。
+        let draw_btn = |cv: &mut Canvas,
+                        hits: &mut Vec<HitBox>,
+                        bx: i32,
+                        by: i32,
+                        bw: i32,
+                        bh: i32,
+                        label: &str,
+                        font: &TextMask,
+                        style: BtnStyle,
+                        action: SetupAction| {
+            let hovered = view.hover == Some(action) && !matches!(style, BtnStyle::Disabled);
+            let pressed = view.pressed == Some(action) && !matches!(style, BtnStyle::Disabled);
+            let (fill_c, fill_a, border_c, border_a, text_c, text_a) = match style {
+                BtnStyle::Accent => (
+                    th.accent,
+                    if pressed { 0.34 } else if hovered { 0.24 } else { 0.14 },
+                    th.accent,
+                    if hovered { 0.95 } else { 0.70 },
+                    if view.light { hex(0x064D60) } else { hex(0xE8FCFF) },
+                    1.0,
+                ),
+                BtnStyle::Warn => (
+                    th.warn,
+                    if pressed { 0.34 } else if hovered { 0.24 } else { 0.14 },
+                    th.warn,
+                    if hovered { 0.95 } else { 0.72 },
+                    if view.light { hex(0x7A4200) } else { hex(0xFFF3DC) },
+                    1.0,
+                ),
+                BtnStyle::Ghost => (
+                    th.accent,
+                    if pressed { 0.20 } else if hovered { 0.11 } else { 0.03 },
+                    th.accent,
+                    if hovered { 0.65 } else { 0.28 },
+                    if hovered { th.value } else { th.label },
+                    0.95,
+                ),
+                BtnStyle::Disabled => (th.idle, 0.08, th.idle, 0.25, th.idle, 0.8),
+            };
+            if hovered && !view.light && matches!(style, BtnStyle::Accent | BtnStyle::Warn) {
+                cv.glow(bx as f32, by as f32, bw as f32, bh as f32, f(4.0), border_c, 0.18);
+            }
+            cv.rrect(bx as f32, by as f32, bw as f32, bh as f32, f(4.5), fill_c, fill_a, None);
+            cv.rrect_stroke(bx as f32 + 0.5, by as f32 + 0.5, bw as f32 - 1.0, bh as f32 - 1.0, f(4.5), 1.0, border_c, border_a);
+            let (tw, th_px) = font.measure(label);
+            let tx = bx + (bw - tw) / 2;
+            let base = by + (bh - th_px) / 2 + font.ascent();
+            font.draw(cv, label, tx, base, text_c, text_a);
+            if !matches!(style, BtnStyle::Disabled) {
+                hits.push(HitBox { rect: [bx, by, bx + bw, by + bh], action });
+            }
+        };
+
+        // ---------- 標題列 ----------
+        let ix = shadow + pad_x;
+        let hy = shadow + pad_y;
+        // 左上角迷你三柱 LED 圖示（呼應系統匣圖示）。
+        let logo_sz = s(20.0);
+        cv.rrect(ix as f32, (hy + s(1.0)) as f32, logo_sz as f32, logo_sz as f32, f(4.0), PANEL, 1.0, Some(PANEL_TOP));
+        cv.rrect_stroke(ix as f32 + 0.5, (hy + s(1.0)) as f32 + 0.5, logo_sz as f32 - 1.0, logo_sz as f32 - 1.0, f(4.0), 1.0, th.accent, 0.85);
+        for (i, (bar_h, c)) in [(5.0, th.accent), (8.5, th.accent), (12.0, th.warn)].iter().enumerate() {
+            let bx = ix as f32 + f(4.0 + i as f32 * 4.5);
+            let by = (hy + s(1.0)) as f32 + f(16.0 - bar_h);
+            cv.rrect(bx, by, f(2.6), f(*bar_h), f(0.8), *c, 1.0, None);
+        }
+        let (_, title_h) = title_f.measure("環境設定");
+        let title_base = hy + (s(22.0) - title_h) / 2 + title_f.ascent();
+        title_f.draw(&mut cv, "AI QUOTA BAR  ·  環境設定", ix + logo_sz + s(10.0), title_base, head_c, 1.0);
+        let (_, sub_h) = body_f.measure("說明");
+        let sub_base = hy + s(28.0) + (s(20.0) - sub_h) / 2 + body_f.ascent();
+        body_f.draw(
+            &mut cv,
+            "偵測各家 AI 工具與登入狀態；設定完成後，額度會自動出現在工作列。",
+            ix,
+            sub_base,
+            th.label,
+            0.95,
+        );
+
+        // 右上角關閉按鈕「×」。
+        let close_sz = s(28.0);
+        let close_x = shadow + card_w - pad_x - close_sz;
+        let close_y = hy - s(2.0);
+        let close_hov = view.hover == Some(SetupAction::Close);
+        let close_prs = view.pressed == Some(SetupAction::Close);
+        if close_hov || close_prs {
+            let bg = if close_prs { th.crit } else { th.accent };
+            cv.rrect(close_x as f32, close_y as f32, close_sz as f32, close_sz as f32, f(5.0), bg, if close_prs { 0.30 } else { 0.16 }, None);
+            cv.rrect_stroke(close_x as f32 + 0.5, close_y as f32 + 0.5, close_sz as f32 - 1.0, close_sz as f32 - 1.0, f(5.0), 1.0, bg, 0.7);
+        }
+        let (xw, xh) = title_f.measure("×");
+        title_f.draw(
+            &mut cv,
+            "×",
+            close_x + (close_sz - xw) / 2,
+            close_y + (close_sz - xh) / 2 + title_f.ascent() - s(1.0),
+            if close_hov { th.value } else { th.label },
+            0.95,
+        );
+        hits.push(HitBox { rect: [close_x, close_y, close_x + close_sz, close_y + close_sz], action: SetupAction::Close });
+
+        // 標題分隔線。
+        let div_y = hy + header_h - s(2.0);
+        for xx in ix..(ix + inner_w) {
+            cv.blend(xx, div_y, th.accent, 0.22);
+        }
+
+        // ---------- 四家服務卡片 ----------
+        let mut cy = hy + header_h + header_gap;
+        let icon_sz = s(34.0);
+        let right_col_w = s(138.0);
+        let card_pad = s(14.0);
+        let mid_x = ix + card_pad + icon_sz + s(14.0);
+        let btn_x = ix + inner_w - card_pad - right_col_w;
+        let mid_max_w = (btn_x - mid_x - s(14.0)).max(s(120.0));
+
+        for item in view.items {
+            let sp = setup::spec(item.provider);
+            let (status_c, border_a) = match item.state {
+                State::Ready => (ready_c, if view.light { 0.55 } else { 0.36 }),
+                State::NeedsLogin => (th.warn, if view.light { 0.55 } else { 0.32 }),
+                State::NotInstalled => (th.idle, if view.light { 0.35 } else { 0.22 }),
+                State::Checking => (th.accent, 0.30),
+                State::Error => (th.crit, 0.40),
+            };
+            let card_border = match item.state {
+                State::Ready => ready_c,
+                State::NeedsLogin => th.warn,
+                State::Error => th.crit,
+                _ => th.accent,
+            };
+            cv.rrect(ix as f32, cy as f32, inner_w as f32, item_h as f32, f(6.0), card_bg, if view.light { 0.94 } else { 0.95 }, None);
+            cv.rrect_stroke(ix as f32 + 0.5, cy as f32 + 0.5, inner_w as f32 - 1.0, item_h as f32 - 1.0, f(6.0), 1.0, card_border, border_a);
+
+            // 左側圖示（有 App 圖示就畫圖示，否則畫 HUD 縮寫徽章）。
+            let ic_x = ix + card_pad;
+            let ic_y = cy + (item_h - icon_sz) / 2;
+            if let Some(icon) = crate::icons::get(item.provider, icon_sz, view.light) {
+                let alpha = if item.state == State::NotInstalled { 0.65 } else { 1.0 };
+                for yy in 0..icon.size {
+                    for xx in 0..icon.size {
+                        let p = icon.px[(yy * icon.size + xx) as usize];
+                        cv.blend(ic_x + xx, ic_y + yy, Rgb(p[0], p[1], p[2]), p[3] * alpha);
+                    }
+                }
+            } else {
+                cv.rrect(ic_x as f32, ic_y as f32, icon_sz as f32, icon_sz as f32, f(6.0), th.accent, if view.light { 0.12 } else { 0.10 }, None);
+                cv.rrect_stroke(ic_x as f32 + 0.5, ic_y as f32 + 0.5, icon_sz as f32 - 1.0, icon_sz as f32 - 1.0, f(6.0), 1.0, th.accent, 0.40);
+                let (bw, bh) = badge_f.measure(sp.badge);
+                badge_f.draw(&mut cv, sp.badge, ic_x + (icon_sz - bw) / 2, ic_y + (icon_sz - bh) / 2 + badge_f.ascent(), head_c, 0.95);
+            }
+            // 圖示右下角狀態燈。
+            let lr = f(3.6);
+            let (lx, ly) = ((ic_x + icon_sz) as f32 - lr * 0.35, (ic_y + icon_sz) as f32 - lr * 0.35);
+            cv.circle(lx, ly, lr + f(1.5), card_bg, 1.0);
+            if !view.light && item.state != State::NotInstalled {
+                cv.glow(lx - lr, ly - lr, lr * 2.0, lr * 2.0, f(5.0), status_c, 0.38);
+            }
+            cv.circle(lx, ly, lr, status_c, 1.0);
+
+            // 中間第 1 行：服務名稱 ＋ 狀態標籤。
+            let (nw, nh) = name_f.measure(item.provider.name());
+            let row1_y = cy + s(11.0);
+            let row1_h = s(20.0);
+            name_f.draw(&mut cv, item.provider.name(), mid_x, row1_y + (row1_h - nh) / 2 + name_f.ascent(), th.value, 1.0);
+
+            let badge_txt = if item.state == State::Ready { format!("✓ {}", item.badge) } else { item.badge.clone() };
+            let (pw, ph) = small_f.measure(&badge_txt);
+            let pill_x = mid_x + nw + s(10.0);
+            let pill_w = pw + s(12.0);
+            let pill_h = s(19.0);
+            let pill_y = row1_y + (row1_h - pill_h) / 2;
+            cv.rrect(pill_x as f32, pill_y as f32, pill_w as f32, pill_h as f32, f(4.0), status_c, if view.light { 0.14 } else { 0.16 }, None);
+            cv.rrect_stroke(pill_x as f32 + 0.5, pill_y as f32 + 0.5, pill_w as f32 - 1.0, pill_h as f32 - 1.0, f(4.0), 1.0, status_c, 0.50);
+            small_f.draw(&mut cv, &badge_txt, pill_x + s(6.0), pill_y + (pill_h - ph) / 2 + small_f.ascent(), status_c, 1.0);
+
+            // 中間第 2 行：詳細狀態說明。
+            let row2_y = cy + s(35.0);
+            let detail_fit = body_f.fit_text(&item.detail, mid_max_w);
+            let (_, dh) = body_f.measure(&detail_fit);
+            let detail_c = match item.state {
+                State::Error => th.crit,
+                State::NeedsLogin => th.warn,
+                _ => th.label,
+            };
+            body_f.draw(&mut cv, &detail_fit, mid_x, row2_y + (s(18.0) - dh) / 2 + body_f.ascent(), detail_c, 0.96);
+
+            // 中間第 3 行：官方指令預覽（已就緒時顯示工具名稱）。
+            let row3_y = cy + s(57.0);
+            let row3_h = s(21.0);
+            if !item.command.is_empty() {
+                let code_txt = mono_f.fit_text(&format!("> {}", item.command), mid_max_w - s(12.0));
+                let (cw_txt, ch_txt) = mono_f.measure(&code_txt);
+                let pill_cw = (cw_txt + s(12.0)).min(mid_max_w);
+                cv.rrect(mid_x as f32, row3_y as f32, pill_cw as f32, row3_h as f32, f(4.0), code_bg, 0.95, None);
+                cv.rrect_stroke(mid_x as f32 + 0.5, row3_y as f32 + 0.5, pill_cw as f32 - 1.0, row3_h as f32 - 1.0, f(4.0), 1.0, th.accent, 0.18);
+                mono_f.draw(
+                    &mut cv,
+                    &code_txt,
+                    mid_x + s(6.0),
+                    row3_y + (row3_h - ch_txt) / 2 + mono_f.ascent(),
+                    if view.light { hex(0x0B566B) } else { hex(0x9CE8FA) },
+                    0.95,
+                );
+            } else {
+                let tool_txt = body_f.fit_text(&format!("來源工具：{}", sp.tool), mid_max_w);
+                let (_, th_txt) = body_f.measure(&tool_txt);
+                body_f.draw(&mut cv, &tool_txt, mid_x, row3_y + (row3_h - th_txt) / 2 + body_f.ascent(), th.idle, 0.95);
+            }
+
+            // 右側操作按鈕區。
+            let primary_h = s(30.0);
+            let sub_h = s(24.0);
+            let sub_gap = s(6.0);
+            let btns_y = cy + (item_h - (primary_h + sub_gap + sub_h)) / 2;
+
+            let (p_label, p_style) = match (item.primary_label, &item.state, item.running) {
+                (Some(lbl), _, true) => (lbl, BtnStyle::Disabled),
+                (Some(lbl), State::NotInstalled, false) => (lbl, BtnStyle::Accent),
+                (Some(lbl), State::NeedsLogin | State::Error, false) => (lbl, BtnStyle::Warn),
+                (Some(lbl), State::Ready, false) => (lbl, BtnStyle::Ghost),
+                (Some(lbl), State::Checking, false) => (lbl, BtnStyle::Disabled),
+                (None, _, _) => ("檢查中…", BtnStyle::Disabled),
+            };
+            draw_btn(
+                &mut cv,
+                &mut hits,
+                btn_x,
+                btns_y,
+                right_col_w,
+                primary_h,
+                p_label,
+                &btn_f,
+                p_style,
+                SetupAction::Run(item.provider, item.mode),
+            );
+
+            let copy_w = s(76.0);
+            let docs_w = right_col_w - copy_w - sub_gap;
+            let row_sub_y = btns_y + primary_h + sub_gap;
+            draw_btn(&mut cv, &mut hits, btn_x, row_sub_y, copy_w, sub_h, "複製指令", &btn_sm_f, BtnStyle::Ghost, SetupAction::Copy(item.provider));
+            draw_btn(&mut cv, &mut hits, btn_x + copy_w + sub_gap, row_sub_y, docs_w, sub_h, "官網", &btn_sm_f, BtnStyle::Ghost, SetupAction::Docs(item.provider));
+
+            cy += item_h + item_gap;
+        }
+
+        // ---------- 底部列 ----------
+        let foot_div_y = cy - item_gap + footer_gap / 2;
+        for xx in ix..(ix + inner_w) {
+            cv.blend(xx, foot_div_y, th.accent, 0.20);
+        }
+        let fy = cy - item_gap + footer_gap;
+        let close_w = s(66.0);
+        let refresh_w = s(88.0);
+        let foot_btn_h = s(28.0);
+        let foot_btn_y = fy + (footer_h - foot_btn_h) / 2;
+        let close_bx = ix + inner_w - close_w;
+        let refresh_bx = close_bx - s(8.0) - refresh_w;
+
+        let notice_max_w = (refresh_bx - ix - s(14.0)).max(s(120.0));
+        let (notice_txt, notice_c) = match view.notice {
+            Some(msg) => (body_f.fit_text(msg, notice_max_w), head_c),
+            None => (
+                body_f.fit_text("點擊「安裝並登入」會開啟 PowerShell，按 Enter 確認後才執行。", notice_max_w),
+                th.label,
+            ),
+        };
+        let (_, nh_f) = body_f.measure(&notice_txt);
+        body_f.draw(&mut cv, &notice_txt, ix, fy + (footer_h - nh_f) / 2 + body_f.ascent(), notice_c, 0.95);
+
+        draw_btn(&mut cv, &mut hits, refresh_bx, foot_btn_y, refresh_w, foot_btn_h, "重新檢查", &btn_f, BtnStyle::Accent, SetupAction::Refresh);
+        draw_btn(&mut cv, &mut hits, close_bx, foot_btn_y, close_w, foot_btn_h, "關閉", &btn_f, BtnStyle::Ghost, SetupAction::Close);
+
+        (cv.into_frame_exact(), shadow, hits)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -773,6 +1229,104 @@ mod tests {
         assert_eq!(sheen(&base, 0.0, 1.0, false).px, base.px);
         assert_eq!(sheen(&base, 1.0, 1.0, false).px, base.px);
         assert_eq!(sheen(&base, 1.0, 1.0, true).px, base.px);
+    }
+
+    #[test]
+    fn empty_setup_banner_is_compact() {
+        let m = Model {
+            blocks: vec![Block { provider: None, name: "點此設定 AI 環境".into(), rows: vec![], stale: false }],
+            dark: true,
+            light: false,
+            hover: false,
+            show_remaining: false,
+        };
+        let f = render(&m, 40, 1.0);
+        assert!(f.w > 90 && f.w < 220, "橫幅寬度應緊湊，實際 {}", f.w);
+        assert_eq!(f.h, 40);
+    }
+
+    #[test]
+    fn setup_wizard_produces_non_overlapping_hitboxes() {
+        use crate::model::{FetchError, Quota, Window};
+        let q = Quota {
+            plan: Some("pro".into()),
+            windows: vec![Window { short: "5H".into(), name: "5 小時".into(), used: 20.0, resets_at: None, detail: None, period: None }],
+            extra: vec![],
+        };
+        let items = vec![
+            setup::diagnose(Provider::Claude, true, Some(&q), None, true, false),
+            setup::diagnose(Provider::Codex, true, None, Some(&FetchError::NotSetUp("找不到".into())), true, false),
+            setup::diagnose(Provider::Copilot, true, None, Some(&FetchError::NotSetUp("找不到".into())), false, false),
+            setup::diagnose(Provider::Antigravity, true, None, Some(&FetchError::LoginExpired("過期".into())), true, false),
+        ];
+        let view = SetupView { items: &items, hover: None, pressed: None, notice: None, light: false };
+        let (frame, shadow, hits) = setup_wizard(&view, 1.0);
+        assert!(frame.w > 600 && frame.h > 500);
+        assert!(shadow > 0);
+        // 4 家 × (主按鈕 + 複製 + 官網) + 關閉× + 重新檢查 + 關閉 = 15 個點擊區。
+        assert_eq!(hits.len(), 15);
+        for (i, a) in hits.iter().enumerate() {
+            assert!(a.rect[0] >= shadow && a.rect[2] <= frame.w - shadow);
+            assert!(a.rect[1] >= shadow && a.rect[3] <= frame.h - shadow);
+            for b in &hits[i + 1..] {
+                let overlap = a.rect[0] < b.rect[2] && a.rect[2] > b.rect[0] && a.rect[1] < b.rect[3] && a.rect[3] > b.rect[1];
+                assert!(!overlap, "按鈕重疊：{a:?} vs {b:?}");
+            }
+        }
+    }
+
+    /// 視覺檢視環境設定精靈用：`PREVIEW_DIR=<資料夾> cargo test setup_preview -- --ignored`。
+    #[test]
+    #[ignore]
+    fn setup_preview() {
+        use crate::model::{FetchError, Quota, Window};
+        let dir = std::env::var("PREVIEW_DIR").expect("PREVIEW_DIR");
+        let q = Quota {
+            plan: Some("pro".into()),
+            windows: vec![Window { short: "5H".into(), name: "5 小時".into(), used: 25.0, resets_at: None, detail: None, period: None }],
+            extra: vec![],
+        };
+        let items = vec![
+            setup::diagnose(Provider::Claude, true, Some(&q), None, true, false),
+            setup::diagnose(Provider::Codex, true, None, Some(&FetchError::NotSetUp("找不到".into())), true, false),
+            setup::diagnose(Provider::Copilot, true, None, Some(&FetchError::NotSetUp("找不到".into())), false, false),
+            setup::diagnose(Provider::Antigravity, true, None, Some(&FetchError::NotSetUp("找不到".into())), false, false),
+        ];
+        for (light, bg, name) in [(false, [0x22, 0x1E, 0x1A], "setup-dark"), (true, [0xEE, 0xEA, 0xE6], "setup-light")] {
+            let view = SetupView {
+                items: &items,
+                hover: Some(SetupAction::Run(Provider::Copilot, RunMode::InstallAndLogin)),
+                pressed: None,
+                notice: None,
+                light,
+            };
+            let (f, _, _) = setup_wizard(&view, 1.25);
+            let mut out = Vec::new();
+            let row_len = (f.w * 3 + 3) & !3;
+            let size = 54 + row_len * f.h;
+            out.extend(b"BM");
+            out.extend((size as u32).to_le_bytes());
+            out.extend([0u8; 4]);
+            out.extend(54u32.to_le_bytes());
+            out.extend(40u32.to_le_bytes());
+            out.extend(f.w.to_le_bytes());
+            out.extend(f.h.to_le_bytes());
+            out.extend(1u16.to_le_bytes());
+            out.extend(24u16.to_le_bytes());
+            out.extend([0u8; 24]);
+            for y in (0..f.h).rev() {
+                let start = out.len();
+                for x in 0..f.w {
+                    let px = f.px[(y * f.w + x) as usize];
+                    let a = px[3] as u32;
+                    for c in 0..3 {
+                        out.push((px[c] as u32 + bg[c] as u32 * (255 - a) / 255).min(255) as u8);
+                    }
+                }
+                out.resize(start + row_len as usize, 0);
+            }
+            std::fs::write(format!("{dir}/{name}.bmp"), out).unwrap();
+        }
     }
 
     /// 預覽用：`PREVIEW_DIR=<資料夾> cargo test --release preview -- --ignored`，

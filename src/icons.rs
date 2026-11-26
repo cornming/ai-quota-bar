@@ -193,3 +193,8 @@ pub fn get(p: Provider, size: i32, light: bool) -> Option<Rc<Icon>> {
     v
 }
 
+/// 清除圖示快取（新安裝好工具或手動重新檢查時重新嘗試載入）。
+pub fn clear_cache() {
+    CACHE.with(|c| c.borrow_mut().clear());
+}
+

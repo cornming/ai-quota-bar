@@ -8,7 +8,7 @@ HUD 風格面板：邊框與四角括號、LED 分段進度條、等寬數字。
 
 - 支援 **Claude**（5 小時、每週）、**Codex**（依方案的 5 小時／每週／30 天）、**GitHub Copilot**（每月聊天、補全、進階請求）、**Antigravity**（Gemini 與 Claude/GPT 兩組，可選顯示 5 小時、每週或較緊的那個）。
 - 直接讀各工具已經存好的登入資料，不用另外輸入帳號密碼或 API key。唯一會寫回的是 Claude 的登入檔（見下方「Claude 登入自動更新」），其他家只讀不寫。
-- 單一 EXE（約 430 KB），沒有任何遙測，資料只送往各家官方伺服器。
+- 單一 EXE（約 490 KB），沒有任何遙測，資料只送往各家官方伺服器。
 - 預設顯示「已用」百分比；右鍵選單勾「顯示剩餘百分比」可改成跟 Antigravity、Claude 網頁一樣顯示「還剩多少」，進度條也跟著改成剩餘量。
 - 每組有多個額度時（例如 Antigravity 的 5 小時與每週），工作列預設只顯示最緊的那個，滑鼠移上去可看全部。Antigravity 可在右鍵選單「Antigravity 顯示」固定顯示 5 小時或每週。
 - 用量 75% 以上變琥珀色、90% 以上變紅（顯示剩餘時也是依已用程度變色）；資料過期時圖示轉灰、整塊淡化。
@@ -19,8 +19,8 @@ HUD 風格面板：邊框與四角括號、LED 分段進度條、等寬數字。
 | 操作 | 效果 |
 | --- | --- |
 | 滑鼠移到上面 | 顯示每一個額度的詳細用量與重置時間 |
-| 左鍵 | 立即更新 |
-| 右鍵 | 選單：立即更新、顯示／隱藏各家、Copilot 帳號、Antigravity 顯示（較緊的／5 小時／每週）、顯示在哪個螢幕、顯示剩餘百分比、主題（跟隨系統／深色／淺色）、隱藏工作列小工具、開啟 Claude 用量頁面、開機時自動啟動、結束 |
+| 左鍵 | 立即更新（四家皆未設定時開啟「環境設定」精靈） |
+| 右鍵 | 選單：立即更新、顯示／隱藏各家、Copilot 帳號、Antigravity 顯示（較緊的／5 小時／每週）、顯示在哪個螢幕、顯示剩餘百分比、主題（跟隨系統／深色／淺色）、隱藏工作列小工具、環境設定…、開啟 Claude 用量頁面、開機時自動啟動、結束 |
 | 系統匣圖示：左鍵 | 顯示／隱藏整個工作列小工具（隱藏後從這裡叫回來） |
 | 系統匣圖示：右鍵 | 同一份選單 |
 
@@ -28,16 +28,20 @@ HUD 風格面板：邊框與四角括號、LED 分段進度條、等寬數字。
 
 伺服器回「查詢太頻繁」（HTTP 429）時會自動放慢：等待時間每次加倍，最長 30 分鐘，期間點左鍵也不會再查；滑鼠提示會顯示下次自動重試的時間，數字淡化顯示上次的結果。
 
-## 各家需要的登入
+## 各家需要的登入與環境引導
 
-| 服務 | 讀取來源 | 沒有的話 |
+若電腦上四家工具都還沒安裝或登入，啟動時會自動開啟一次內建的「環境設定」精靈；平時也可以隨時從右鍵選單「環境設定…」（或點工作列上的「點此設定 AI 環境」）叫出，查看各家偵測狀態，或複製官方指令／開啟官網。
+
+在精靈裡點擊「安裝並登入」或「前往登入」時，會開啟可見的 PowerShell 視窗先列出將執行的官方指令，等您按 Enter 確認後才執行安裝與登入；視窗關閉後會自動重新偵測環境並顯示額度，不需要重開 AI Quota Bar。
+
+| 服務 | 讀取來源 | 沒有的話（官方安裝／登入） |
 | --- | --- | --- |
-| Claude | `%USERPROFILE%\.claude\.credentials.json`（Claude Code 登入訂閱帳號） | 執行 `claude` 登入 |
-| Codex | `%USERPROFILE%\.codex\auth.json`（Codex 用 ChatGPT 帳號登入） | 執行 `codex` 登入 |
-| Copilot | `gh auth token`（GitHub CLI）；gh 登入多個帳號時，右鍵選單「Copilot 帳號」可選要顯示哪一個（例如個人或公司） | 執行 `gh auth login` |
-| Antigravity | `%LOCALAPPDATA%\agy\bin\agy.exe -p /usage` | 安裝並登入 Antigravity CLI |
+| Claude | `%USERPROFILE%\.claude\.credentials.json`（Claude Code 登入訂閱帳號） | `irm https://claude.ai/install.ps1 \| iex`，再執行 `claude auth login` |
+| Codex | `%USERPROFILE%\.codex\auth.json`（Codex 用 ChatGPT 帳號登入） | `irm https://chatgpt.com/codex/install.ps1 \| iex`，再執行 `codex login` |
+| Copilot | `gh auth token`（GitHub CLI）；gh 登入多個帳號時，右鍵選單「Copilot 帳號」可選要顯示哪一個（例如個人或公司） | `winget install -e --id GitHub.cli`，再執行 `gh auth login --hostname github.com --web` |
+| Antigravity | `%LOCALAPPDATA%\agy\bin\agy.exe -p /usage` | `irm https://antigravity.google/cli/install.ps1 \| iex`，再執行 `agy` 登入 |
 
-找不到登入資料的那家不會出現在工作列上。
+找不到登入資料的那家不會出現在工作列上；若四家皆未設定，工作列會顯示「點此設定 AI 環境」。
 
 ## Claude 登入自動更新
 
