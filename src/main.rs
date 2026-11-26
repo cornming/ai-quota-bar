@@ -14,6 +14,7 @@ mod providers;
 mod render;
 mod setup;
 mod taskbar;
+mod updater;
 mod wizard;
 
 use http::wide;
@@ -34,7 +35,8 @@ use windows_sys::Win32::UI::Controls::*;
 use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
 use windows_sys::Win32::UI::Shell::{
-    ShellExecuteW, Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
+    ShellExecuteW, Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIM_ADD, NIM_DELETE,
+    NIM_MODIFY, NIN_BALLOONUSERCLICK, NOTIFYICONDATAW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 use windows_sys::w;
@@ -54,11 +56,14 @@ const CMD_MONITOR_BASE: usize = 200;
 const CMD_TOGGLE_WIDGET: usize = 22;
 const CMD_SHOW_REMAINING: usize = 23;
 const CMD_OPEN_SETUP: usize = 24;
+const CMD_UPDATE: usize = 25;
 const CMD_THEME_BASE: usize = 300;
 const THEME_NAMES: [&str; 3] = ["跟隨系統", "深色", "淺色"];
 const CMD_AGY_BASE: usize = 400;
 const WM_APP_TRAY: u32 = WM_APP + 2;
 const WM_APP_SETUP_DONE: u32 = WM_APP + 3;
+const WM_APP_UPDATE_CHECKED: u32 = WM_APP + 4;
+const WM_APP_UPDATE_RESULT: u32 = WM_APP + 5;
 const TRAY_ID: u32 = 1;
 
 const REG_APP: &str = "Software\\AiQuotaBar";
@@ -82,6 +87,83 @@ struct Slot {
 static SLOTS: Mutex<[Option<Slot>; 4]> = Mutex::new([None, None, None, None]);
 static HIDDEN: [AtomicBool; 4] = [const { AtomicBool::new(false) }; 4];
 static CTL: AtomicIsize = AtomicIsize::new(0);
+
+// ---------- 自動更新狀態 ----------
+
+struct UpdateState {
+    available: Option<updater::ReleaseInfo>,
+    checking: bool,
+    downloading: bool,
+    last_error: Option<String>,
+    relaunch_exe: Option<std::path::PathBuf>,
+}
+
+static UPDATE: Mutex<UpdateState> = Mutex::new(UpdateState {
+    available: None,
+    checking: false,
+    downloading: false,
+    last_error: None,
+    relaunch_exe: None,
+});
+
+fn post_ui(msg: u32, wp: usize) {
+    let ctl = CTL.load(Ordering::Relaxed);
+    if ctl != 0 {
+        unsafe { PostMessageW(ctl as HWND, msg, wp, 0) };
+    }
+}
+
+/// 背景執行緒：啟動後稍等片刻查一次 GitHub Releases，之後每 6 小時自動檢查；
+/// 收到 `true`（手動檢查）時立即檢查。
+fn spawn_update_checker() -> Sender<bool> {
+    let (tx, rx) = channel::<bool>();
+    std::thread::spawn(move || {
+        let mut manual = match rx.recv_timeout(updater::INITIAL_DELAY) {
+            Ok(m) => m,
+            Err(RecvTimeoutError::Timeout) => false,
+            Err(RecvTimeoutError::Disconnected) => return,
+        };
+        loop {
+            {
+                let mut u = UPDATE.lock().unwrap();
+                u.checking = true;
+                u.last_error = None;
+            }
+            let res = updater::check_latest();
+            {
+                let mut u = UPDATE.lock().unwrap();
+                u.checking = false;
+                match res {
+                    Ok(info) => {
+                        u.available = info;
+                        u.last_error = None;
+                    }
+                    Err(e) => {
+                        u.last_error = Some(e);
+                    }
+                }
+            }
+            post_ui(WM_APP_UPDATE_CHECKED, manual as usize);
+
+            let deadline = std::time::Instant::now() + updater::CHECK_INTERVAL;
+            manual = loop {
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                match rx.recv_timeout(left) {
+                    Ok(m) => {
+                        let mut flag = m;
+                        while let Ok(more) = rx.try_recv() {
+                            flag |= more;
+                        }
+                        break flag;
+                    }
+                    Err(RecvTimeoutError::Timeout) => break false,
+                    Err(RecvTimeoutError::Disconnected) => return,
+                }
+            };
+        }
+    });
+    tx
+}
 
 fn slot(p: Provider) -> Slot {
     SLOTS.lock().unwrap()[p.index()].clone().unwrap_or_default()
@@ -236,6 +318,9 @@ struct Ui {
     sheen_start: Option<std::time::Instant>,
     pos: (i32, i32, i32, i32),
     workers: Vec<Sender<()>>,
+    update_tx: Option<Sender<bool>>,
+    /// 避免更新確認視窗重複跳出。
+    update_dialog_open: bool,
     /// 要顯示在哪個螢幕（裝置名稱）；None 為主螢幕。
     monitor: Option<String>,
     /// 使用者把小工具整個隱藏了（從系統匣圖示再叫出來）。
@@ -412,6 +497,15 @@ fn tooltip_lines() -> Vec<render::TipLine> {
             if let (Some(u), Some(_)) = (s.updated, &s.quota) {
                 lines.push(line(TipKind::Note, format!("（顯示的是 {} 的資料）", local_time(u)), None));
             }
+        }
+    }
+    {
+        let u = UPDATE.lock().unwrap();
+        if u.downloading {
+            let tag = u.available.as_ref().map(|r| r.tag.as_str()).unwrap_or("新版本");
+            lines.push(line(TipKind::Header, format!("正在下載並驗證更新 {tag}…"), None));
+        } else if let Some(info) = &u.available {
+            lines.push(line(TipKind::Header, format!("★ 有新版本 {}（右鍵選單可一鍵更新）", info.tag), None));
         }
     }
     let footer = if needs_setup_banner() {
@@ -867,6 +961,160 @@ unsafe fn tray_remove(ctl: HWND) {
     Shell_NotifyIconW(NIM_DELETE, &nid);
 }
 
+unsafe fn tray_balloon(ctl: HWND, title: &str, body: &str) {
+    let mut nid = tray_data(ctl);
+    nid.uFlags = NIF_INFO;
+    nid.dwInfoFlags = NIIF_INFO;
+    let t: Vec<u16> = title.encode_utf16().collect();
+    let tn = t.len().min(nid.szInfoTitle.len() - 1);
+    nid.szInfoTitle[..tn].copy_from_slice(&t[..tn]);
+    let b: Vec<u16> = body.encode_utf16().collect();
+    let bn = b.len().min(nid.szInfo.len() - 1);
+    nid.szInfo[..bn].copy_from_slice(&b[..bn]);
+    Shell_NotifyIconW(NIM_MODIFY, &nid);
+}
+
+/// 詢問使用者是否立即下載並自動更新；同意後在背景下載、驗證 SHA-256 並準備重啟。
+unsafe fn prompt_and_start_update() {
+    if with(|u| u.update_dialog_open) {
+        return;
+    }
+    let Some(info) = ({
+        let u = UPDATE.lock().unwrap();
+        if u.downloading {
+            None
+        } else {
+            u.available.clone()
+        }
+    }) else {
+        return;
+    };
+    with(|u| u.update_dialog_open = true);
+    let mut msg = format!("發現新版本 {}（目前為 v{}）", info.tag, updater::CURRENT_VERSION);
+    if !info.summary.is_empty() {
+        msg.push_str("\n\n");
+        msg.push_str(&info.summary);
+    }
+    msg.push_str("\n\n要立即下載並自動更新嗎？\n（會驗證 SHA-256 校驗碼，更新完成後自動重新啟動）");
+    let ans = MessageBoxW(
+        null_mut(),
+        wide(&msg).as_ptr(),
+        wide("AI Quota Bar 更新").as_ptr(),
+        MB_YESNO | MB_ICONINFORMATION | MB_SETFOREGROUND | MB_TOPMOST,
+    );
+    with(|u| u.update_dialog_open = false);
+    if ans != IDYES {
+        return;
+    }
+    {
+        let mut u = UPDATE.lock().unwrap();
+        if u.downloading {
+            return;
+        }
+        u.downloading = true;
+        u.last_error = None;
+    }
+    update_tip();
+    std::thread::spawn(move || match updater::download_and_stage(&info) {
+        Ok(exe) => {
+            let mut u = UPDATE.lock().unwrap();
+            u.downloading = false;
+            u.relaunch_exe = Some(exe);
+            drop(u);
+            post_ui(WM_APP_UPDATE_RESULT, 1);
+        }
+        Err(e) => {
+            let mut u = UPDATE.lock().unwrap();
+            u.downloading = false;
+            u.last_error = Some(e);
+            drop(u);
+            post_ui(WM_APP_UPDATE_RESULT, 0);
+        }
+    });
+}
+
+unsafe fn trigger_update_menu_action() {
+    let (has_avail, busy) = {
+        let u = UPDATE.lock().unwrap();
+        (u.available.is_some(), u.checking || u.downloading)
+    };
+    if busy {
+        return;
+    }
+    if has_avail {
+        prompt_and_start_update();
+    } else if let Some(tx) = with(|u| u.update_tx.clone()) {
+        UPDATE.lock().unwrap().checking = true;
+        let _ = tx.send(true);
+    }
+}
+
+unsafe fn on_update_checked(ctl: HWND, manual: bool) {
+    update_tip();
+    let (avail, err) = {
+        let u = UPDATE.lock().unwrap();
+        (u.available.clone(), u.last_error.clone())
+    };
+    if manual {
+        if avail.is_some() {
+            prompt_and_start_update();
+        } else if let Some(e) = err {
+            MessageBoxW(
+                null_mut(),
+                wide(&format!("檢查更新失敗：\n{e}")).as_ptr(),
+                wide("AI Quota Bar 更新").as_ptr(),
+                MB_OK | MB_ICONWARNING | MB_SETFOREGROUND | MB_TOPMOST,
+            );
+        } else {
+            MessageBoxW(
+                null_mut(),
+                wide(&format!("目前已是最新版本（v{}）。", updater::CURRENT_VERSION)).as_ptr(),
+                wide("AI Quota Bar 更新").as_ptr(),
+                MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND | MB_TOPMOST,
+            );
+        }
+    } else if let Some(info) = avail {
+        // 每個新版本只彈一次系統匣通知，避免每次開機都打擾。
+        if reg_get_string(REG_APP, "NotifiedVersion").as_deref() != Some(info.tag.as_str()) {
+            reg_set_string(REG_APP, "NotifiedVersion", &info.tag);
+            tray_balloon(
+                ctl,
+                &format!("AI Quota Bar 有新版本 {}", info.tag),
+                "點此通知或從右鍵選單即可一鍵更新。",
+            );
+        }
+    }
+}
+
+unsafe fn on_update_result(ctl: HWND, ok: bool) {
+    if ok {
+        // 正常結束訊息迴圈，等 token 換完並釋放 Mutex 後再啟動新版。
+        DestroyWindow(ctl);
+        return;
+    }
+    update_tip();
+    let (err, url) = {
+        let u = UPDATE.lock().unwrap();
+        (
+            u.last_error.clone().unwrap_or_else(|| "未知錯誤".into()),
+            u.available
+                .as_ref()
+                .map(|r| r.html_url.clone())
+                .unwrap_or_else(|| "https://github.com/cornming/ai-quota-bar/releases/latest".into()),
+        )
+    };
+    let msg = format!("自動更新失敗：\n{err}\n\n要開啟 GitHub Release 頁面手動下載嗎？");
+    let ans = MessageBoxW(
+        null_mut(),
+        wide(&msg).as_ptr(),
+        wide("AI Quota Bar 更新").as_ptr(),
+        MB_YESNO | MB_ICONWARNING | MB_SETFOREGROUND | MB_TOPMOST,
+    );
+    if ans == IDYES {
+        ShellExecuteW(null_mut(), w!("open"), wide(&url).as_ptr(), null(), null(), SW_SHOWNORMAL);
+    }
+}
+
 unsafe fn show_menu() {
     let (ctl, widget) = with(|u| (u.ctl, u.widget));
     let menu = CreatePopupMenu();
@@ -933,6 +1181,19 @@ unsafe fn show_menu() {
     add(CMD_TOGGLE_WIDGET, if hidden_now { "顯示工作列小工具" } else { "隱藏工作列小工具" }, false);
     AppendMenuW(menu, MF_SEPARATOR, 0, null());
     add(CMD_OPEN_SETUP, "環境設定…", false);
+    {
+        let u = UPDATE.lock().unwrap();
+        if u.downloading {
+            let tag = u.available.as_ref().map(|r| r.tag.as_str()).unwrap_or("新版本");
+            AppendMenuW(menu, MF_STRING | MF_GRAYED, CMD_UPDATE, wide(&format!("正在更新 {tag}…")).as_ptr());
+        } else if u.checking {
+            AppendMenuW(menu, MF_STRING | MF_GRAYED, CMD_UPDATE, wide("正在檢查更新…").as_ptr());
+        } else if let Some(info) = &u.available {
+            add(CMD_UPDATE, &format!("更新到 {}…", info.tag), false);
+        } else {
+            add(CMD_UPDATE, &format!("檢查更新（v{}）", updater::CURRENT_VERSION), false);
+        }
+    }
     add(CMD_OPEN_CLAUDE, "開啟 Claude 用量頁面", false);
     add(CMD_AUTOSTART, "開機時自動啟動", reg_has_value(REG_RUN, RUN_NAME));
     AppendMenuW(menu, MF_SEPARATOR, 0, null());
@@ -948,6 +1209,7 @@ unsafe fn show_menu() {
     match cmd {
         CMD_REFRESH => refresh_all(),
         CMD_OPEN_SETUP => open_setup(),
+        CMD_UPDATE => trigger_update_menu_action(),
         CMD_AUTOSTART => set_autostart(!reg_has_value(REG_RUN, RUN_NAME)),
         CMD_OPEN_CLAUDE => {
             ShellExecuteW(null_mut(), w!("open"), w!("https://claude.ai/settings/usage"), null(), null(), SW_SHOWNORMAL);
@@ -1041,6 +1303,14 @@ unsafe extern "system" fn ctl_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
             refresh_after_setup(None);
             0
         }
+        WM_APP_UPDATE_CHECKED => {
+            on_update_checked(h, wp != 0);
+            0
+        }
+        WM_APP_UPDATE_RESULT => {
+            on_update_result(h, wp != 0);
+            0
+        }
         WM_TIMER if wp == TIMER_ANIM => {
             animate_tick();
             0
@@ -1064,6 +1334,7 @@ unsafe extern "system" fn ctl_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
             match lp as u32 {
                 WM_LBUTTONUP => toggle_widget(),
                 WM_RBUTTONUP | WM_CONTEXTMENU => show_menu(),
+                NIN_BALLOONUSERCLICK => prompt_and_start_update(),
                 _ => {}
             }
             0
@@ -1207,9 +1478,25 @@ fn main() {
         return;
     }
     let open_setup_arg = args.iter().any(|a| a == "--setup");
+    let updated_arg = args.iter().any(|a| a == "--updated");
+    updater::cleanup_old_exe();
     unsafe {
-        CreateMutexW(null(), 0, w!("Local\\AiQuotaBar"));
-        if GetLastError() == ERROR_ALREADY_EXISTS {
+        // 剛更新完重啟時，舊程序可能還在結束中，稍等它釋放單實例 Mutex。
+        let mut mutex = null_mut();
+        for attempt in 0..if updated_arg { 50 } else { 1 } {
+            if attempt > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            let h = CreateMutexW(null(), 0, w!("Local\\AiQuotaBar"));
+            if GetLastError() != ERROR_ALREADY_EXISTS {
+                mutex = h;
+                break;
+            }
+            if !h.is_null() {
+                CloseHandle(h);
+            }
+        }
+        if mutex.is_null() {
             return;
         }
         let hinst = GetModuleHandleW(null());
@@ -1263,6 +1550,8 @@ fn main() {
                 sheen_start: None,
                 pos: (0, 0, 0, 0),
                 workers: Vec::new(),
+                update_tx: None,
+                update_dialog_open: false,
                 monitor: reg_get_string(REG_APP, "Monitor"),
                 widget_hidden: reg_get_dword(HKEY_CURRENT_USER, REG_APP, "WidgetHidden") == Some(1),
                 show_remaining: reg_get_dword(HKEY_CURRENT_USER, REG_APP, "ShowRemaining") == Some(1),
@@ -1273,7 +1562,11 @@ fn main() {
         CTL.store(ctl as isize, Ordering::Relaxed);
         load_agy_period();
         let workers = ALL.iter().map(|p| spawn_worker(*p)).collect();
-        with(|u| u.workers = workers);
+        let update_tx = spawn_update_checker();
+        with(|u| {
+            u.workers = workers;
+            u.update_tx = Some(update_tx);
+        });
         tray_add(ctl);
         ensure_widget();
         if open_setup_arg {
@@ -1287,6 +1580,10 @@ fn main() {
         while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
+        }
+        CloseHandle(mutex);
+        if let Some(exe) = UPDATE.lock().unwrap().relaunch_exe.take() {
+            let _ = std::process::Command::new(exe).arg("--updated").spawn();
         }
     }
 }
